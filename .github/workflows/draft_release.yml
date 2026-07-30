@@ -1,147 +1,159 @@
-# Source: https://raw.githubusercontent.com/xZetsubou/hass-localtuya/refs/heads/master/.github/workflows/draft_release.yml
-
-name: Generate Draft Release
+name: Build and create draft release
 
 on:
   push:
-    workflow_dispatch:
-    branches:
-      - main
+    tags:
+      - 'v*.*.*'
 
 permissions:
   contents: write
 
 env:
   release_commits: |
-    {"section": "breaking_changes",    "prefix": "break",    "header": "💥 Breaking Changes"}
-    {"section": "fixes",               "prefix": "fix",      "header": "🐛 Fixes"           }
-    {"section": "feats",               "prefix": "feat",     "header": "✨ Feats"           }
-    {"section": "improvements",        "prefix": "perf",     "header": "⚡ Improvements"    }
-    {"section": "refactors",           "prefix": "refactor", "header": "♻️ Refactors"       }
-    {"section": "chores",              "prefix": "chore",    "header": "🧹 Chores"          }
-    {"section": "docs",                "prefix": "doc",      "header": "📚 Docs"            }
-    {"section": "revert",              "prefix": "revert",   "header": "🌀 Reverts"         }
-    {"section": "cis",                 "prefix": "ci",       "header": "🛠️ CI"              }
-    {"section": "tests",               "prefix": "test",     "header": "✅ Tests"           }
-    {"section": "more",                "prefix": "",         "header": "➕ More"            }
+    [
+      {"section": "breaking_changes", "prefix": "break",    "header": "💥 Breaking Changes"},
+      {"section": "fixes",            "prefix": "fix",      "header": "🐛 Fixes"},
+      {"section": "feats",            "prefix": "feat",     "header": "✨ Feats"},
+      {"section": "improvements",     "prefix": "perf",     "header": "⚡ Improvements"},
+      {"section": "refactors",        "prefix": "refactor", "header": "♻️ Refactors"},
+      {"section": "chores",           "prefix": "chore",    "header": "🧹 Chores"},
+      {"section": "docs",             "prefix": "doc",      "header": "📚 Docs"},
+      {"section": "revert",           "prefix": "revert",   "header": "🌀 Reverts"},
+      {"section": "cis",              "prefix": "ci",       "header": "🛠️ CI"},
+      {"section": "tests",            "prefix": "test",     "header": "✅ Tests"},
+      {"section": "more",             "prefix": "",         "header": "➕ More"}
+    ]
 
 jobs:
-  generate-release-draft:
+  release:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Fetch all tags and history
+          fetch-depth: 0
 
-      - name: Get latest release tag
-        id: latest-release
+      - name: Build
+        run: scripts/build
+
+      - name: Find previous tag
+        id: prev_tag
         run: |
-          latest_tag=$(curl --silent --fail \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/latest" \
-            | jq -r .tag_name)
-          echo "Latest release tag: $latest_tag"
-          echo "latest_tag=$latest_tag" >> $GITHUB_ENV
+          git fetch --tags --force
+          current_tag="${GITHUB_REF_NAME}"
+          previous_tag=$(git tag --sort=-creatordate | grep -Fxv "$current_tag" | head -n 1 || true)
+          echo "previous_tag=$previous_tag" >> "$GITHUB_ENV"
 
-      - name: Get commits from latest release to HEAD
+      - name: Generate release notes
         run: |
-          git fetch --tags
-          git log ${{ env.latest_tag }}..HEAD --pretty=format:'%s by @%an,%ae,%cL in [`%h`](https://github.com/${{github.repository}}/commit/%H)' --reverse > commits.md
-          echo "" >> commits.md
+          if [[ -n "${{ env.previous_tag }}" ]]; then
+            range="${{ env.previous_tag }}..${GITHUB_REF_NAME}"
+          else
+            range="${GITHUB_REF_NAME}"
+          fi
 
-          declare -A cache_nickname;
+          git log "$range" --pretty=format:'%s by @%an,%ae,%cL in [`%h`](https://github.com/${{ github.repository }}/commit/%H)' --reverse > commits.md
+
+          tmp=$(mktemp)
+          cp commits.md "$tmp"
+
+          declare -A cache_nickname
+
           while IFS= read -r line; do
-                    author_info=$(echo "$line" | grep -oP 'by @\K.*?(?= in)')
-                    commit=$(echo "$line" | grep -oP '/commit/\K[a-f0-9]+')
-                    IFS=$',' read -r name email mail_name _ <<< "$author_info"
+            author_info=$(echo "$line" | grep -oP 'by @\K.*?(?= in)')
+            commit=$(echo "$line" | grep -oP '/commit/\K[a-f0-9]+')
+            IFS=',' read -r name email mail_name _ <<< "$author_info"
 
-                    if [[ "$email" != *"noreply"* ]]; then
-                      if [[ -v cache_nickname[$email] ]]; then
-                        username="${cache_nickname[$email]}"
-                      else
-                        username=$(curl --silent --fail \
-                                  -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-                                  "https://api.github.com/search/commits?q=$commit" \
-                                  | jq -r '.items[0].author.login')
-                        cache_nickname[$email]=$username
-                      fi
-                      if [[ $username != null ]]; then
-                        sed -i "s#$author_info#$username#g" "commits.md"
-                        continue
-                      fi
-                    fi
+            username=""
 
-                    if [[ "$email" =~ (^[0-9]+)?\+?([a-zA-Z0-9]+)@ ]]; then
-                      id="${BASH_REMATCH[1]}"; mail_name="${BASH_REMATCH[2]}";
-                      username=$name && [[ -n $id ]] && username=$mail_name
-                    fi
-                    sed -i "s#$author_info#$username#g" "commits.md"
-          done < commits.md
+            if [[ "$email" != *"noreply"* ]]; then
+              if [[ -v cache_nickname[$email] ]]; then
+                username="${cache_nickname[$email]}"
+              else
+                username=$(curl --silent --fail \
+                  -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+                  -H "Accept: application/vnd.github+json" \
+                  "https://api.github.com/search/commits?q=$commit" \
+                  | jq -r '.items[0].author.login // empty')
+                cache_nickname[$email]=$username
+              fi
 
-      - name: Parse commit messages and categorize
-        id: parse_commits
-        run: |
-          declare -A commits_map;
+              if [[ -n "$username" ]]; then
+                sed -i "s#${author_info}#${username}#g" "$tmp"
+                continue
+              fi
+            fi
+
+            if [[ "$email" =~ (^[0-9]+)?\+?([a-zA-Z0-9]+)@ ]]; then
+              id="${BASH_REMATCH[1]}"
+              mail_name="${BASH_REMATCH[2]}"
+              username="$name"
+              [[ -n "$id" ]] && username="$mail_name"
+            else
+              username="$name"
+            fi
+
+            sed -i "s#${author_info}#${username}#g" "$tmp"
+          done < "$tmp"
+
+          mv "$tmp" commits.md
+
+          declare -A commits_map
+          jq -n '{}' > commitsJson
 
           while IFS= read -r line; do
             first_lower=$(echo "$line" | awk '{print $1}' | tr '[:upper:]' '[:lower:]')
             scope=$(echo "$line" | cut -d' ' -f1)
             commit_desc=$(echo "$line" | cut -d' ' -f2-)
-
-            parsed_commit="- **$scope** $commit_desc\n"
+            parsed_commit="- **$scope** $commit_desc"
 
             added=false
-            while read -r item; do
-              section=$(echo "$item"  | jq -r '.section')
-              prefix=$(echo "$item"   | jq -r '.prefix')
+            while IFS= read -r item; do
+              section=$(echo "$item" | jq -r '.section')
+              prefix=$(echo "$item" | jq -r '.prefix')
 
-              if [[ "$first_lower" == $prefix* ]]; then
-                commits_map[$section]+=$parsed_commit && added=true && break
+              if [[ -n "$prefix" && "$first_lower" == $prefix* ]]; then
+                commits_map["$section"]+="$parsed_commit"$'\n'
+                added=true
+                break
               fi
-            done < <(echo '${{env.release_commits}}')
-            [[ $added == false ]] && commits_map["more"]+=$parsed_commit
+            done < <(jq -c '.[]' <<< '${{ env.release_commits }}')
 
+            if [[ "$added" == false ]]; then
+              commits_map["more"]+="$parsed_commit"$'\n'
+            fi
           done < commits.md
 
-          jq -n '{}' commitsJson > tempJson && mv tempJson commitsJson
           for key in "${!commits_map[@]}"; do
             jq --arg key "$key" --arg value "${commits_map[$key]}" \
               '. + {($key): $value}' commitsJson > tempJson && mv tempJson commitsJson
           done
 
-      - name: Create Release Notes
-        id: release-notes
-        run: |
-          notes="#### 🚨 **Note**: This draft has been released in $(date +'%Y.%m.%d - %H:%M:%S')\n\n"
+          notes="#### 🚨 **Note**: This draft has been released in $(date +'%Y.%m.%d - %H:%M:%S')"$'\n\n'
 
-          while read -r item; do
-            section=$(echo "$item"  | jq -r '.section') && [[ ! "$section" =~ [^[:space:]] ]] && continue
-            header=$(echo "$item"   | jq -r '.header') 
+          while IFS= read -r item; do
+            section=$(echo "$item" | jq -r '.section')
+            header=$(echo "$item" | jq -r '.header')
+            section_commits=$(jq -r --arg k "$section" '.[$k] // empty' commitsJson)
 
-            [[ ! "$section" =~ [^[:space:]] ]] && continue
-
-            section_commits=$(jq -r --arg k "$section" '.[$k]' commitsJson)
-            if [ -n "$section_commits" ] && [ "$section_commits" != null ]; then
-              notes+="### $header \n $section_commits \n"
+            if [[ -n "$section_commits" ]]; then
+              notes+="### $header"$'\n'
+              notes+="$section_commits"$'\n'
             fi
+          done < <(jq -c '.[]' <<< '${{ env.release_commits }}')
 
-          done < <(echo '${{env.release_commits}}')
+          printf "%b" "$notes" > commits.md
 
-          set -f; echo -e $notes > commits.md; set +f
-
-      - name: Remove old Draft
-        id: remove_drafts
-        continue-on-error: true
+      - name: Create or update draft release with ZIP
+        uses: softprops/action-gh-release@v3
+        with:
+          draft: true
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+          name: ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          body_path: commits.md
+          files: ./hass-openid.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release delete "Draft Latest version"
-
-      - name: Create Release Draft
-        uses: softprops/action-gh-release@v1
-        with:
-          name: 'Draft Latest version'
-          tag_name: 'Draft Latest version'
-          body_path: commits.md
-          draft: true

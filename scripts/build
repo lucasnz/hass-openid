@@ -1,0 +1,5 @@
+#!/bin/bash
+set -e
+
+cd custom_components/openid/
+zip -r ../../hass-openid.zip ./*
