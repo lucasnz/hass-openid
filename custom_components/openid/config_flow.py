@@ -316,7 +316,7 @@ class OpenIDConfigFlow(ConfigFlow, domain=DOMAIN):
                         vol.Required(CONF_AUTHORIZE_URL): _url_selector(),
                         vol.Required(CONF_TOKEN_URL): _url_selector(),
                         vol.Required(CONF_USER_INFO_URL): _url_selector(),
-                        vol.Required(CONF_LOGOUT_URL, default=""): _url_selector(),
+                        vol.Optional(CONF_LOGOUT_URL): _url_selector(),
                         vol.Required(CONF_VALIDATE_TLS): BooleanSelector(),
                         vol.Required(CONF_USE_PKCE): BooleanSelector(
                             BooleanSelectorConfig(
