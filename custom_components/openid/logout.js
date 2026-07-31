@@ -1,113 +1,81 @@
 const LOGOUT_SESSION_ENDPOINT = "/auth/openid/session";
-let sessionLoaded = false;
-let sessionData = null;
 
+let handlingLogout = false;
 
+const findHass = () => document.querySelector("home-assistant")?.hass;
+
+const waitForHass = async () => {
+  while (true) {
+    const hass = findHass();
+    if (hass?.auth) {
+      return hass;
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 250));
+  }
+};
 
 const loadLogoutSession = async (hass) => {
-  if (sessionLoaded) {
-    console.log("hass-openid: using cached session metadata");
-    return sessionData;
-  }
-
-  sessionLoaded = true;
-  console.log("hass-openid: fetching session metadata from", LOGOUT_SESSION_ENDPOINT);
-
   try {
     let response;
-    if (hass && hass.fetchWithAuth) {
-      console.log("hass-openid: using hass.fetchWithAuth");
+
+    if (hass?.fetchWithAuth) {
       response = await hass.fetchWithAuth(LOGOUT_SESSION_ENDPOINT);
-    } else if (hass && hass.auth && (hass.auth.accessToken || hass.auth.data?.access_token)) {
-      console.log("hass-openid: using manual fetch with token");
-      const token = hass.auth.accessToken || hass.auth.data.access_token;
+    } else {
+      const token = hass?.auth?.accessToken || hass?.auth?.data?.access_token;
+      if (!token) {
+        return null;
+      }
+
       response = await fetch(LOGOUT_SESSION_ENDPOINT, {
         headers: {
           Authorization: `Bearer ${token}`,
         },
       });
-    } else {
-      // Try getting token from localStorage
-      let token = null;
-      try {
-        const tokens = JSON.parse(window.localStorage.getItem("hassTokens"));
-        token = tokens?.access_token;
-      } catch (e) {
-        console.warn("hass-openid: failed to get tokens from localStorage", e);
-      }
-
-      if (token) {
-        console.log("hass-openid: using token from localStorage");
-        response = await fetch(LOGOUT_SESSION_ENDPOINT, {
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
-        });
-      } else {
-        console.log("hass-openid: no auth available, using same-origin");
-        response = await fetch(LOGOUT_SESSION_ENDPOINT, {
-          credentials: "same-origin",
-        });
-      }
     }
 
-    console.log("hass-openid: session fetch response status:", response.status);
-
-    if (!response.ok || response.status === 204) {
-      sessionData = null;
-      return sessionData;
+    if (response.status === 204) {
+      return null;
     }
 
-    sessionData = await response.json();
-    console.log("hass-openid: loaded session metadata:", sessionData);
+    if (!response.ok) {
+      throw new Error(`session endpoint returned HTTP ${response.status}`);
+    }
+
+    const metadata = await response.json();
+    return metadata?.logout_url ? metadata : null;
   } catch (err) {
-    console.warn("hass-openid: failed to load logout metadata", err);
-    sessionData = null;
+    console.warn("hass-openid: failed to preload logout metadata", err);
+    return null;
   }
-
-  return sessionData;
 };
 
 const buildLogoutUrl = (metadata) => {
-  if (!metadata || !metadata.logout_url) {
+  if (!metadata?.logout_url) {
     return null;
   }
 
-  let target;
-
   try {
-    target = new URL(metadata.logout_url, window.location.origin);
+    const target = new URL(metadata.logout_url, window.location.origin);
+    const params = metadata.parameters || {};
+
+    Object.entries(params).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== "") {
+        target.searchParams.set(key, value);
+      }
+    });
+
+    return target.toString();
   } catch (err) {
-    console.warn("hass-openid: invalid logout url", err);
+    console.warn("hass-openid: invalid logout URL", err);
     return null;
   }
-
-  const params = metadata.parameters || {};
-
-  Object.entries(params).forEach(([key, value]) => {
-    if (value !== undefined && value !== null && value !== "") {
-      target.searchParams.set(key, value);
-    }
-  });
-
-  return target.toString();
 };
 
-const clearFrontendState = () => {
-  try {
-    window.localStorage.clear();
-  } catch (err) {
-    console.warn("hass-openid: unable to clear local storage", err);
-  }
-};
-
-const revokeFrontendAuth = async (hass) => {
+const performLogout = async (hass, redirectUrl) => {
   try {
     await hass.auth.revoke();
   } catch (err) {
-    console.error("hass-openid: revoke failed", err);
-    alert("Log out failed");
-    throw err;
+    console.warn("hass-openid: Home Assistant token revocation failed", err);
   }
 
   try {
@@ -116,71 +84,40 @@ const revokeFrontendAuth = async (hass) => {
     console.warn("hass-openid: connection close failed", err);
   }
 
-  clearFrontendState();
+  window.location.assign(redirectUrl);
 };
 
-let handlingLogout = false;
-const performLogout = async (hass, redirectUrl) => {
-  console.log("hass-openid: performing logout, redirect to:", redirectUrl);
+const initializeLogoutOverride = async () => {
+  const hass = await waitForHass();
+  const metadata = await loadLogoutSession(hass);
+  const redirectUrl = buildLogoutUrl(metadata);
 
-  if (!hass || !hass.auth) {
-    console.log("hass-openid: no hass object, clearing state and redirecting");
-    clearFrontendState();
-    window.location.href = redirectUrl;
+  // When no end-session endpoint is configured, leave Home Assistant's native
+  // logout handling completely untouched.
+  if (!redirectUrl) {
     return;
   }
 
-  console.log("hass-openid: revoking frontend auth");
-  try {
-    await revokeFrontendAuth(hass);
-  } catch (err) {
-    console.error("hass-openid: revoke failed, redirecting anyway", err);
-    // Still redirect even if revoke fails
-  }
+  window.addEventListener(
+    "hass-logout",
+    async (event) => {
+      event.preventDefault();
+      event.stopImmediatePropagation();
 
-  console.log("hass-openid: redirecting to:", redirectUrl);
-  window.location.href = redirectUrl;
-};
-
-window.addEventListener(
-  "hass-logout",
-  async (event) => {
-    event.stopImmediatePropagation();
-    event.preventDefault();
-    console.log("Logout started and overwritten");
-    window.logoutStarted = true;
-  },
-  { capture: true }
-);
-
-
-window.addEventListener("closed",
-  (event) => {
-
-    if(window.logoutStarted) {
       if (handlingLogout) {
-        console.log("hass-openid: already handling logout, ignoring duplicate event");
         return;
       }
 
       handlingLogout = true;
-      const finish = async () => {
-        const app = document.querySelector("home-assistant");
-        const hass = app?.hass;
 
-        console.log("hass-openid: getting preloaded logout session metadata");
-        //const metadata = sessionData
-        const metadata = await loadLogoutSession(hass);
-        let redirectUrl = buildLogoutUrl(metadata);
-
-        if (!redirectUrl) {
-          console.warn("hass-openid: no logout URL configured, redirecting to /");
-          redirectUrl = "/";
-        }
-        await performLogout(hass, redirectUrl);
+      try {
+        await performLogout(findHass() || hass, redirectUrl);
+      } finally {
+        handlingLogout = false;
       }
-      finish().finally(() => {
-         handlingLogout = false;
-      });
-    }
-  }); 
+    },
+    { capture: true },
+  );
+};
+
+void initializeLogoutOverride();
