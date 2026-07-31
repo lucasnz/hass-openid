@@ -1,0 +1,74 @@
+"""Bounded, expiring in-memory state storage for OpenID flows."""
+
+from __future__ import annotations
+
+from time import monotonic
+from typing import Any
+
+from homeassistant.core import HomeAssistant
+
+AUTH_STATE_STORE = "_openid_state"
+CONSENT_STATE_STORE = "_openid_consent_pending"
+ANDROID_STATE_STORE = "_openid_android_callbacks"
+
+AUTH_STATE_TTL = 10 * 60
+ANDROID_STATE_TTL = 15 * 60
+MAX_PENDING_ENTRIES = 256
+
+
+def _cleanup(store: dict[str, dict[str, Any]], ttl: float) -> None:
+    """Remove expired entries from a state store."""
+    cutoff = monotonic() - ttl
+    for key, entry in list(store.items()):
+        if entry.get("created_at", 0.0) < cutoff:
+            store.pop(key, None)
+
+
+def store_pending(
+    hass: HomeAssistant,
+    store_name: str,
+    key: str,
+    value: dict[str, Any],
+    *,
+    ttl: float = AUTH_STATE_TTL,
+) -> None:
+    """Store a bounded pending entry."""
+    store: dict[str, dict[str, Any]] = hass.data.setdefault(store_name, {})
+    _cleanup(store, ttl)
+
+    if len(store) >= MAX_PENDING_ENTRIES:
+        oldest_key = min(
+            store,
+            key=lambda candidate: store[candidate].get("created_at", 0.0),
+        )
+        store.pop(oldest_key, None)
+
+    store[key] = {"created_at": monotonic(), "value": dict(value)}
+
+
+def get_pending(
+    hass: HomeAssistant,
+    store_name: str,
+    key: str,
+    *,
+    ttl: float = AUTH_STATE_TTL,
+) -> dict[str, Any] | None:
+    """Return a pending entry when it exists and has not expired."""
+    store: dict[str, dict[str, Any]] = hass.data.setdefault(store_name, {})
+    _cleanup(store, ttl)
+    entry = store.get(key)
+    return dict(entry["value"]) if entry else None
+
+
+def pop_pending(
+    hass: HomeAssistant,
+    store_name: str,
+    key: str,
+    *,
+    ttl: float = AUTH_STATE_TTL,
+) -> dict[str, Any] | None:
+    """Remove and return a pending entry when it has not expired."""
+    store: dict[str, dict[str, Any]] = hass.data.setdefault(store_name, {})
+    _cleanup(store, ttl)
+    entry = store.pop(key, None)
+    return dict(entry["value"]) if entry else None

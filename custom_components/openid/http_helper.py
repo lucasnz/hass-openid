@@ -16,6 +16,11 @@ from homeassistant.core import HomeAssistant
 
 from .config_helpers import get_active_config
 from .const import CONF_BLOCK_LOGIN, CONF_OPENID_TEXT, CONF_TRUSTED_IPS
+from .state_store import (
+    ANDROID_STATE_STORE,
+    ANDROID_STATE_TTL,
+    store_pending,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -152,19 +157,12 @@ def override_authorize_route(hass: HomeAssistant) -> Callable[[], None] | None:
 
         params = dict(request.query)
 
-        _LOGGER.debug(
-            "override_authorize_route intercepted /auth/authorize with params: %s",
-            params,
-        )
 
         base_url = f"{request.scheme}://{request.host}"
         params["base_url"] = base_url
 
         if "state" in params:
             params["client_state"] = params["state"]
-            _LOGGER.debug(
-                "Preserving original OAuth state as client_state: %s", params["state"]
-            )
 
         is_android_client = (
             params.get("client_id") == "https://home-assistant.io/android"
@@ -178,12 +176,12 @@ def override_authorize_route(hass: HomeAssistant) -> Callable[[], None] | None:
         if is_android_client:
             params["client_state"] = android_client_state
             params.setdefault("state", android_client_state)
-            hass.data.setdefault("_openid_android_callbacks", {})[
-                android_client_state
-            ] = {"status": "pending"}
-            _LOGGER.debug(
-                "Android authorize interception initialized poll state: %s",
+            store_pending(
+                hass,
+                ANDROID_STATE_STORE,
                 android_client_state,
+                {"status": "pending"},
+                ttl=ANDROID_STATE_TTL,
             )
 
         if "client_id" not in params and "state" in params:
@@ -193,23 +191,16 @@ def override_authorize_route(hass: HomeAssistant) -> Callable[[], None] | None:
                 state_json = json.loads(decoded)
                 if "clientId" in state_json:
                     params["client_id"] = state_json["clientId"].rstrip("/")
-                    _LOGGER.debug(
-                        "Extracted client_id from state: %s", params["client_id"]
-                    )
             except (ValueError, TypeError, json.JSONDecodeError):
                 _LOGGER.warning("Failed to extract client_id from state", exc_info=True)
 
         query_string = urlencode(params)
         redirect_url = f"/auth/openid/authorize?{query_string}"
 
-        _LOGGER.debug("Redirecting to: %s", redirect_url)
 
         if is_android_client:
             safe_redirect_url = redirect_url.replace("'", "%27").replace('"', "%22")
             safe_state = android_client_state.replace("'", "%27").replace('"', "%22")
-            _LOGGER.debug(
-                "Serving Android wait-and-poll page for state: %s", android_client_state
-            )
             return Response(
                 status=HTTPStatus.OK,
                 content_type="text/html",

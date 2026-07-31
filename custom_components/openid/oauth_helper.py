@@ -2,6 +2,8 @@
 
 from base64 import b64encode
 from http import HTTPStatus
+
+from aiohttp import ClientTimeout
 import logging
 from typing import Any
 
@@ -56,10 +58,14 @@ async def exchange_code_for_token(
         data["client_secret"] = client_secret
 
     _LOGGER.debug("Exchanging code for token at %s", token_url)
-    async with session.post(token_url, data=data, headers=headers) as resp:
+    async with session.post(
+        token_url,
+        data=data,
+        headers=headers,
+        timeout=ClientTimeout(total=15),
+    ) as resp:
         if resp.status != HTTPStatus.OK:
-            text = await resp.text()
-            raise RuntimeError(f"Token endpoint returned {resp.status}: {text}")
+            raise RuntimeError(f"Token endpoint returned HTTP {resp.status}")
         return await resp.json()
 
 
@@ -78,8 +84,9 @@ async def fetch_user_info(
     headers = {"Authorization": f"Bearer {access_token}"}
 
     _LOGGER.debug("Fetching user info from %s", user_info_url)
-    async with session.get(user_info_url, headers=headers) as resp:
+    async with session.get(
+        user_info_url, headers=headers, timeout=ClientTimeout(total=15)
+    ) as resp:
         if resp.status != HTTPStatus.OK:
-            text = await resp.text()
-            raise RuntimeError(f"User info endpoint returned {resp.status}: {text}")
+            raise RuntimeError(f"User info endpoint returned HTTP {resp.status}")
         return await resp.json()

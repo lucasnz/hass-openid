@@ -16,6 +16,7 @@ from homeassistant.components.http import StaticPathConfig
 from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry
 from homeassistant.const import CONF_CLIENT_ID, CONF_CLIENT_SECRET
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.typing import ConfigType
 
@@ -135,7 +136,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if yaml_config := hass.data[DOMAIN].get(DATA_YAML_IMPORT_CONFIG):
         runtime_config = dict(yaml_config)
     else:
-        runtime_config = await _async_prepare_config(hass, runtime_config)
+        try:
+            runtime_config = await _async_prepare_config(hass, runtime_config)
+        except Exception as err:  # noqa: BLE001
+            raise ConfigEntryNotReady(
+                "OpenID provider discovery is not currently available"
+            ) from err
     set_active_config(hass, runtime_config)
     _activate_runtime_patches(hass)
     hass.data[DOMAIN][DATA_ACTIVE_ENTRY_ID] = entry.entry_id
@@ -189,6 +195,16 @@ async def _async_prepare_config(
 
     if CONF_USE_PKCE not in config:
         config[CONF_USE_PKCE] = bool(discovered[DISCOVERY_PKCE_AVAILABLE])
+
+    missing = [
+        key
+        for key in (CONF_AUTHORIZE_URL, CONF_TOKEN_URL, CONF_USER_INFO_URL)
+        if not config.get(key)
+    ]
+    if missing:
+        raise RuntimeError(
+            f"OpenID discovery did not provide required endpoints: {', '.join(missing)}"
+        )
 
     return config
 

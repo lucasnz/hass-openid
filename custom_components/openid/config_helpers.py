@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from http import HTTPStatus
+
+from aiohttp import ClientTimeout
 from ipaddress import IPv4Network, IPv6Network, ip_network
 import logging
 from typing import Any
@@ -84,7 +86,9 @@ async def async_discover_configuration(
     session = aiohttp_client.async_get_clientsession(hass, verify_ssl=validate_tls)
 
     _LOGGER.debug("Fetching OpenID configuration from %s", configure_url)
-    async with session.get(configure_url) as resp:
+    async with session.get(
+        configure_url, timeout=ClientTimeout(total=15)
+    ) as resp:
         if resp.status != HTTPStatus.OK:
             raise RuntimeError(f"Configuration endpoint returned {resp.status}")
 
