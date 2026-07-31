@@ -14,6 +14,9 @@ from homeassistant.helpers import aiohttp_client
 
 from .const import (
     CONF_AUTHORIZE_URL,
+    CONF_ID_TOKEN_SIGNING_ALGORITHMS,
+    CONF_ISSUER,
+    CONF_JWKS_URL,
     CONF_LOGOUT_URL,
     CONF_TOKEN_URL,
     CONF_TRUSTED_IPS,
@@ -100,5 +103,10 @@ async def async_discover_configuration(
         CONF_TOKEN_URL: config_data.get("token_endpoint"),
         CONF_USER_INFO_URL: config_data.get("userinfo_endpoint"),
         CONF_LOGOUT_URL: config_data.get("end_session_endpoint"),
+        CONF_ISSUER: config_data.get("issuer"),
+        CONF_JWKS_URL: config_data.get("jwks_uri"),
+        CONF_ID_TOKEN_SIGNING_ALGORITHMS: config_data.get(
+            "id_token_signing_alg_values_supported", ["RS256"]
+        ),
         DISCOVERY_PKCE_AVAILABLE: "S256" in pkce_methods,
     }

@@ -34,6 +34,9 @@ from .const import (
     CONF_CONFIGURE_URL,
     CONF_CREATE_USER,
     CONF_ERROR_URL,
+    CONF_ID_TOKEN_SIGNING_ALGORITHMS,
+    CONF_ISSUER,
+    CONF_JWKS_URL,
     CONF_LOGOUT_URL,
     CONF_OPENID_TEXT,
     CONF_SCOPE,
@@ -171,12 +174,24 @@ async def _async_prepare_config(
     if CONF_CONFIGURE_URL not in config:
         return config
 
+    openid_requested = "openid" in config.get(CONF_SCOPE, DEFAULT_SCOPE).split()
     needs_discovery = (
         any(
-            key not in config
+            not config.get(key)
             for key in (CONF_AUTHORIZE_URL, CONF_TOKEN_URL, CONF_USER_INFO_URL)
         )
         or CONF_USE_PKCE not in config
+        or (
+            openid_requested
+            and any(
+                not config.get(key)
+                for key in (
+                    CONF_ISSUER,
+                    CONF_JWKS_URL,
+                    CONF_ID_TOKEN_SIGNING_ALGORITHMS,
+                )
+            )
+        )
     )
     if not needs_discovery:
         return config
@@ -193,14 +208,22 @@ async def _async_prepare_config(
     if CONF_LOGOUT_URL not in config and discovered.get(CONF_LOGOUT_URL):
         config[CONF_LOGOUT_URL] = discovered[CONF_LOGOUT_URL]
 
+    for key in (
+        CONF_ISSUER,
+        CONF_JWKS_URL,
+        CONF_ID_TOKEN_SIGNING_ALGORITHMS,
+    ):
+        if key not in config and discovered.get(key):
+            config[key] = discovered[key]
+
     if CONF_USE_PKCE not in config:
         config[CONF_USE_PKCE] = bool(discovered[DISCOVERY_PKCE_AVAILABLE])
 
-    missing = [
-        key
-        for key in (CONF_AUTHORIZE_URL, CONF_TOKEN_URL, CONF_USER_INFO_URL)
-        if not config.get(key)
-    ]
+    required_keys = [CONF_AUTHORIZE_URL, CONF_TOKEN_URL, CONF_USER_INFO_URL]
+    if openid_requested:
+        required_keys.extend((CONF_ISSUER, CONF_JWKS_URL))
+
+    missing = [key for key in required_keys if not config.get(key)]
     if missing:
         raise RuntimeError(
             f"OpenID discovery did not provide required endpoints: {', '.join(missing)}"

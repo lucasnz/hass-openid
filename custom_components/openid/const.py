@@ -9,6 +9,9 @@ CONF_TOKEN_URL = "token_url"
 CONF_USER_INFO_URL = "user_info_url"
 
 CONF_CONFIGURE_URL = "configure_url"
+CONF_ISSUER = "issuer"
+CONF_JWKS_URL = "jwks_url"
+CONF_ID_TOKEN_SIGNING_ALGORITHMS = "id_token_signing_algorithms"
 
 CONF_USERNAME_FIELD = "username_field"
 CONF_SCOPE = "scope"

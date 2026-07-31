@@ -35,6 +35,9 @@ from .const import (
     CONF_BLOCK_LOGIN,
     CONF_CREATE_USER,
     CONF_ERROR_URL,
+    CONF_ID_TOKEN_SIGNING_ALGORITHMS,
+    CONF_ISSUER,
+    CONF_JWKS_URL,
     CONF_LOGOUT_URL,
     CONF_POST_LOGOUT_URL,
     CONF_SCOPE,
@@ -43,12 +46,14 @@ from .const import (
     CONF_USE_PKCE,
     CONF_USER_INFO_URL,
     CONF_USERNAME_FIELD,
+    CONF_VALIDATE_TLS,
     CRED_ID_TOKEN,
     CRED_LOGOUT_REDIRECT_URI,
     CRED_SESSION_STATE,
     DOMAIN,
 )
 from .oauth_helper import exchange_code_for_token, fetch_user_info
+from .oidc_helper import async_validate_id_token
 from .state_store import (
     ANDROID_STATE_STORE,
     ANDROID_STATE_TTL,
@@ -62,6 +67,7 @@ from .state_store import (
 _LOGGER = logging.getLogger(__name__)
 
 _PKCE_VERIFIER_KEY = "pkce_code_verifier"
+_OIDC_NONCE_KEY = "oidc_nonce"
 
 
 def _short_id(value: str | None) -> str:
@@ -234,6 +240,11 @@ class OpenIDAuthorizeView(HomeAssistantView):
             "state": state,
         }
 
+        if "openid" in conf.get(CONF_SCOPE, "").split():
+            nonce = secrets.token_urlsafe(24)
+            stored_params[_OIDC_NONCE_KEY] = nonce
+            query["nonce"] = nonce
+
         if conf.get(CONF_USE_PKCE, False):
             code_verifier, code_challenge = _generate_pkce_pair()
             stored_params[_PKCE_VERIFIER_KEY] = code_verifier
@@ -366,6 +377,11 @@ class OpenIDConsentView(HomeAssistantView):
             "state": state,
         }
 
+        if "openid" in conf.get(CONF_SCOPE, "").split():
+            nonce = secrets.token_urlsafe(24)
+            original_params[_OIDC_NONCE_KEY] = nonce
+            query["nonce"] = nonce
+
         if conf.get(CONF_USE_PKCE, False):
             code_verifier, code_challenge = _generate_pkce_pair()
             original_params[_PKCE_VERIFIER_KEY] = code_verifier
@@ -460,6 +476,34 @@ class OpenIDCallbackView(HomeAssistantView):
                 code_verifier=params.get(_PKCE_VERIFIER_KEY),
             )
 
+            id_token_claims: dict[str, Any] | None = None
+            openid_requested = "openid" in conf.get(CONF_SCOPE, "").split()
+            if openid_requested:
+                id_token = token_data.get("id_token")
+                nonce = params.get(_OIDC_NONCE_KEY)
+                issuer = conf.get(CONF_ISSUER)
+                jwks_url = conf.get(CONF_JWKS_URL)
+                algorithms = conf.get(
+                    CONF_ID_TOKEN_SIGNING_ALGORITHMS, ["RS256"]
+                )
+                if isinstance(algorithms, str):
+                    algorithms = [algorithms]
+                if not all((id_token, nonce, issuer, jwks_url)):
+                    raise ValueError(
+                        "OIDC validation metadata or ID token is missing; "
+                        "use provider discovery for OpenID scope"
+                    )
+                id_token_claims = await async_validate_id_token(
+                    self.hass,
+                    id_token=id_token,
+                    issuer=issuer,
+                    jwks_url=jwks_url,
+                    client_id=conf[CONF_CLIENT_ID],
+                    nonce=nonce,
+                    algorithms=list(algorithms),
+                    validate_tls=bool(conf.get(CONF_VALIDATE_TLS, True)),
+                )
+
             access_token = token_data.get("access_token")
             if not isinstance(access_token, str):
                 _LOGGER.error("Token response missing access token")
@@ -475,6 +519,13 @@ class OpenIDCallbackView(HomeAssistantView):
                 user_info_url=conf[CONF_USER_INFO_URL],
                 access_token=access_token,
             )
+            if id_token_claims is not None:
+                userinfo_sub = user_info.get("sub")
+                token_sub = id_token_claims.get("sub")
+                if not isinstance(userinfo_sub, str) or userinfo_sub != token_sub:
+                    raise ValueError(
+                        "UserInfo subject does not match the validated ID token"
+                    )
         except Exception:
             _LOGGER.exception("Token exchange or user info fetch failed")
             return _show_error(

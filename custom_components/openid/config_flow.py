@@ -31,6 +31,9 @@ from .const import (
     CONF_CONFIGURE_URL,
     CONF_CREATE_USER,
     CONF_ERROR_URL,
+    CONF_ID_TOKEN_SIGNING_ALGORITHMS,
+    CONF_ISSUER,
+    CONF_JWKS_URL,
     CONF_LOGOUT_URL,
     CONF_OPENID_TEXT,
     CONF_SCOPE,
@@ -166,6 +169,8 @@ class OpenIDConfigFlow(ConfigFlow, domain=DOMAIN):
                         CONF_AUTHORIZE_URL,
                         CONF_TOKEN_URL,
                         CONF_USER_INFO_URL,
+                        CONF_ISSUER,
+                        CONF_JWKS_URL,
                     )
                 ):
                     errors["base"] = "invalid_discovery"
@@ -177,6 +182,11 @@ class OpenIDConfigFlow(ConfigFlow, domain=DOMAIN):
                             CONF_AUTHORIZE_URL: discovered[CONF_AUTHORIZE_URL],
                             CONF_TOKEN_URL: discovered[CONF_TOKEN_URL],
                             CONF_USER_INFO_URL: discovered[CONF_USER_INFO_URL],
+                            CONF_ISSUER: discovered[CONF_ISSUER],
+                            CONF_JWKS_URL: discovered[CONF_JWKS_URL],
+                            CONF_ID_TOKEN_SIGNING_ALGORITHMS: discovered.get(
+                                CONF_ID_TOKEN_SIGNING_ALGORITHMS, ["RS256"]
+                            ),
                         }
                     )
                     if discovered.get(CONF_LOGOUT_URL):
