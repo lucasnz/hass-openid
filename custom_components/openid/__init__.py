@@ -19,7 +19,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.typing import ConfigType
 
-from . import ui_views as openid_views
+from . import views as openid_views
 from .auth_provider import async_register_auth_provider
 from .config_helpers import (
     async_discover_configuration,
@@ -112,6 +112,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
                 hass,
                 prepared_yaml_config,
             )
+            _activate_runtime_patches(hass)
         except Exception as err:  # noqa: BLE001
             _LOGGER.error("Failed to prepare YAML OpenID configuration: %s", err)
             return False
@@ -136,6 +137,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     else:
         runtime_config = await _async_prepare_config(hass, runtime_config)
     set_active_config(hass, runtime_config)
+    _activate_runtime_patches(hass)
     hass.data[DOMAIN][DATA_ACTIVE_ENTRY_ID] = entry.entry_id
     return True
 
@@ -149,6 +151,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if domain_data.get(DATA_ACTIVE_ENTRY_ID) == entry.entry_id:
         domain_data.pop(DATA_ACTIVE_ENTRY_ID, None)
         domain_data.pop(DATA_ACTIVE_CONFIG, None)
+        _restore_runtime_patches(hass)
 
     return True
 
@@ -190,21 +193,17 @@ async def _async_prepare_config(
     return config
 
 
-async def _async_setup_shared(hass: HomeAssistant) -> None:
-    """Set up shared OpenID runtime resources."""
+def _activate_runtime_patches(hass: HomeAssistant) -> None:
+    """Install runtime monkey patches while an OpenID config is active."""
     domain_data = hass.data.setdefault(DOMAIN, {})
-    if domain_data.get(DATA_SHARED_INITIALIZED):
+    if domain_data.get("_runtime_patches_active"):
         return
-
-    hass.data.setdefault("_openid_state", {})
-    hass.data.setdefault("_openid_android_callbacks", {})
 
     async def _async_notify_idp_logout(credential: Credentials) -> None:
         """Clear logout-related metadata from credentials."""
         config = get_active_config(hass)
         logout_url: str | None = config.get(CONF_LOGOUT_URL) if config else None
         if not logout_url:
-            _LOGGER.debug("No logout URL configured; skipping logout metadata cleanup")
             return
 
         cleared = False
@@ -214,43 +213,68 @@ async def _async_setup_shared(hass: HomeAssistant) -> None:
             cleared = True
 
         if cleared:
-            hass.auth.async_update_user_credentials_data(
-                credential, dict(credential.data)
+            hass.auth.async_update_user_credentials_data(credential, dict(credential.data))
+
+    original_remove_refresh_token = hass.auth.async_remove_refresh_token
+
+    def _patched_remove_refresh_token(refresh_token: Any) -> None:
+        credential = getattr(refresh_token, "credential", None)
+        if (
+            credential is not None
+            and getattr(credential, "auth_provider_type", None) == DOMAIN
+        ):
+            config = get_active_config(hass)
+            logout_url = config.get(CONF_LOGOUT_URL) if config else None
+            has_logout_metadata = any(
+                credential.data.get(key)
+                for key in (
+                    CRED_ID_TOKEN,
+                    CRED_SESSION_STATE,
+                    CRED_LOGOUT_REDIRECT_URI,
+                )
             )
-            _LOGGER.debug("Cleared logout metadata from credentials")
-
-    if not domain_data.get("_remove_refresh_token_patched"):
-        original_remove_refresh_token = hass.auth.async_remove_refresh_token
-
-        def _patched_remove_refresh_token(refresh_token: Any) -> None:
-            credential = getattr(refresh_token, "credential", None)
-
-            if (
-                credential is not None
-                and getattr(credential, "auth_provider_type", None) == DOMAIN
-            ):
-                config = get_active_config(hass)
-                logout_url = config.get(CONF_LOGOUT_URL) if config else None
-                has_logout_metadata = any(
-                    credential.data.get(key)
-                    for key in (
-                        CRED_ID_TOKEN,
-                        CRED_SESSION_STATE,
-                        CRED_LOGOUT_REDIRECT_URI,
-                    )
+            if logout_url and has_logout_metadata:
+                hass.async_create_background_task(
+                    _async_notify_idp_logout(credential),
+                    name="openid_notify_idp_logout",
                 )
 
-                if logout_url and has_logout_metadata:
-                    hass.async_create_background_task(
-                        _async_notify_idp_logout(credential),
-                        name="openid_notify_idp_logout",
-                    )
+        original_remove_refresh_token(refresh_token)
 
-            original_remove_refresh_token(refresh_token)
+    hass.auth.async_remove_refresh_token = _patched_remove_refresh_token
+    domain_data["_remove_refresh_token_original"] = original_remove_refresh_token
+    domain_data["_route_restore_callbacks"] = [
+        callback
+        for callback in (
+            override_authorize_route(hass),
+            override_authorize_login_flow(hass),
+        )
+        if callback is not None
+    ]
+    domain_data["_runtime_patches_active"] = True
 
-        hass.auth.async_remove_refresh_token = _patched_remove_refresh_token
-        domain_data["_remove_refresh_token_patched"] = True
-        domain_data["_remove_refresh_token_original"] = original_remove_refresh_token
+
+def _restore_runtime_patches(hass: HomeAssistant) -> None:
+    """Restore Home Assistant methods and routes patched by the integration."""
+    domain_data = hass.data.get(DOMAIN, {})
+    if not domain_data.pop("_runtime_patches_active", False):
+        return
+
+    if original := domain_data.pop("_remove_refresh_token_original", None):
+        hass.auth.async_remove_refresh_token = original
+
+    for restore in reversed(domain_data.pop("_route_restore_callbacks", [])):
+        restore()
+
+
+async def _async_setup_shared(hass: HomeAssistant) -> None:
+    """Set up shared OpenID runtime resources."""
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    if domain_data.get(DATA_SHARED_INITIALIZED):
+        return
+
+    hass.data.setdefault("_openid_state", {})
+    hass.data.setdefault("_openid_android_callbacks", {})
 
     authorize_path = hass_frontend.where() / "authorize.html"
     domain_data["authorize_template"] = await asyncio.to_thread(
@@ -304,9 +328,6 @@ async def _async_setup_shared(hass: HomeAssistant) -> None:
     hass.http.register_view(openid_views.OpenIDConsentView(hass))
     hass.http.register_view(openid_views.OpenIDAndroidStatusView(hass))
     hass.http.register_view(openid_views.OpenIDSessionView(hass))
-
-    override_authorize_route(hass)
-    override_authorize_login_flow(hass)
 
     domain_data[DATA_AUTH_PROVIDER] = await async_register_auth_provider(hass)
     domain_data[DATA_SHARED_INITIALIZED] = True

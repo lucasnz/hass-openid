@@ -14,9 +14,8 @@ from string import Template
 from typing import Any
 from urllib.parse import quote, urlencode
 
-from aiohttp.web import Request, Response
 from aiohttp import ClientSession
-
+from aiohttp.web import Request, Response
 from yarl import URL
 
 from homeassistant.auth.const import GROUP_ID_ADMIN, GROUP_ID_USER
@@ -29,13 +28,14 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.network import NoURLAvailableError, get_url
 from homeassistant.util import slugify
 
+from .config_helpers import get_active_config
 from .const import (
     CONF_AUTHORIZE_URL,
     CONF_BLOCK_LOGIN,
     CONF_CREATE_USER,
     CONF_ERROR_URL,
-    CONF_POST_LOGOUT_URL,
     CONF_LOGOUT_URL,
+    CONF_POST_LOGOUT_URL,
     CONF_SCOPE,
     CONF_TOKEN_URL,
     CONF_USE_HEADER_AUTH,
@@ -55,17 +55,35 @@ _PKCE_VERIFIER_KEY = "pkce_code_verifier"
 
 
 def _generate_pkce_pair() -> tuple[str, str]:
-    """Generate a PKCE code_verifier and code_challenge (S256 method).
-
-    See RFC 7636: https://datatracker.ietf.org/doc/html/rfc7636#section-4.1.
-
-    Returns (code_verifier, code_challenge).
-    """
-    # verifier is 43-128 unreserved characters
+    """Generate a PKCE code_verifier and code_challenge pair."""
     code_verifier = secrets.token_urlsafe(96)[:128]
     digest = sha256(code_verifier.encode("ascii")).digest()
     code_challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
     return code_verifier, code_challenge
+
+
+def _android_waiting_response(
+    hass: HomeAssistant,
+    authorize_url: str,
+    poll_state: str,
+) -> Response:
+    """Return Android waiting page that polls for callback completion."""
+    safe_authorize_url = authorize_url.replace("'", "%27").replace('"', "%22")
+    safe_poll_state = poll_state.replace("'", "%27").replace('"', "%22")
+
+    template_content = hass.data[DOMAIN]["android_waiting_template"]
+    template = Template(template_content)
+    html = template.substitute(
+        authorize_url=safe_authorize_url,
+        poll_state=safe_poll_state,
+    )
+
+    return Response(status=HTTPStatus.OK, content_type="text/html", text=html)
+
+
+def _is_android_client(client_id: str | None) -> bool:
+    """Return whether request is from the Home Assistant Android client."""
+    return client_id == "https://home-assistant.io/android"
 
 
 class OpenIDAuthorizeView(HomeAssistantView):
@@ -80,8 +98,8 @@ class OpenIDAuthorizeView(HomeAssistantView):
         self.hass = hass
 
     def should_show_consent_screen(self, params: Mapping[str, str]) -> bool:
-        """Determine whether to show the consent screen based on configuration and request parameters."""
-        conf: dict[str, Any] | None = self.hass.data.get(DOMAIN)
+        """Determine whether to show the consent screen."""
+        conf = get_active_config(self.hass)
         if not conf:
             return False
 
@@ -109,7 +127,6 @@ class OpenIDAuthorizeView(HomeAssistantView):
                 prefer_external=True,
             )
 
-        cloud_url = None
         with suppress(NoURLAvailableError):
             cloud_url = get_url(self.hass, allow_internal=False, require_cloud=True)
 
@@ -127,22 +144,25 @@ class OpenIDAuthorizeView(HomeAssistantView):
 
     async def get(self, request: Request) -> Response:
         """Redirect the browser to the IdP’s authorisation endpoint."""
-        conf: dict[str, str] = self.hass.data[DOMAIN]
+        conf = get_active_config(self.hass)
+        if conf is None:
+            return _show_error(
+                self.hass,
+                request.rel_url.query,
+                alert_type="error",
+                alert_message="OpenID login failed! Integration is not configured.",
+            )
 
         params = request.rel_url.query
-
         _LOGGER.debug("OpenIDAuthorizeView received params: %s", dict(params))
         _LOGGER.debug("OpenIDAuthorizeView full URL: %s", request.url)
 
-        # Check if we should show consent screen
         if self.should_show_consent_screen(params):
             _LOGGER.info(
                 "Showing consent screen for client_id: %s", params.get("client_id")
             )
             return await self._show_consent_screen(request, params)
 
-        # Prefer client-provided state (Music Assistant) so the same value is returned
-        # through the entire flow. Try both "state" and explicit "client_state" (forwarded by JS).
         client_id = params.get("client_id")
         client_state = params.get("client_state") or params.get("state")
         if not client_state and _is_android_client(client_id):
@@ -155,7 +175,7 @@ class OpenIDAuthorizeView(HomeAssistantView):
             )
 
         if client_state:
-            state = secrets.token_urlsafe(24)  # internal CSRF state for IdP
+            state = secrets.token_urlsafe(24)
             params = dict(params)
             params["client_state"] = client_state
             _LOGGER.debug(
@@ -205,7 +225,8 @@ class OpenIDAuthorizeView(HomeAssistantView):
             return _android_waiting_response(self.hass, url, client_state)
 
         _LOGGER.debug("Redirecting to IdP authorize endpoint: %s", url)
-        return Response(status=302, headers={"Location": url})
+        return Response(status=HTTPStatus.FOUND, headers={"Location": url})
+
 
     async def _show_consent_screen(
         self, request: Request, params: Mapping[str, str]
@@ -241,7 +262,6 @@ class OpenIDAuthorizeView(HomeAssistantView):
             cancel_url=params.get("base_url", "/"),
         )
         return Response(status=HTTPStatus.OK, body=html, content_type="text/html")
-        
 
 class OpenIDConsentView(HomeAssistantView):
     """Handle consent form submission."""
@@ -256,7 +276,13 @@ class OpenIDConsentView(HomeAssistantView):
 
     async def post(self, request: Request) -> Response:
         """Handle consent form submission."""
-        conf: dict[str, str] = self.hass.data[DOMAIN]
+        conf = get_active_config(self.hass)
+        if conf is None:
+            return Response(
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+                text="OpenID integration is not configured",
+            )
+
         form_data = await request.post()
 
         consent_state = form_data.get("state")
@@ -264,7 +290,6 @@ class OpenIDConsentView(HomeAssistantView):
             _LOGGER.error("Consent form submitted without state")
             return Response(status=HTTPStatus.BAD_REQUEST, text="Invalid request")
 
-        # Retrieve the original params
         pending = self.hass.data.get("_openid_consent_pending", {})
         original_params = pending.pop(consent_state, None)
 
@@ -276,7 +301,6 @@ class OpenIDConsentView(HomeAssistantView):
 
         _LOGGER.info("User authorized client_id: %s", original_params.get("client_id"))
 
-        # Now proceed with the normal OAuth flow
         client_id = original_params.get("client_id")
         client_state = original_params.get("client_state") or original_params.get(
             "state"
@@ -290,7 +314,7 @@ class OpenIDConsentView(HomeAssistantView):
             )
 
         if client_state:
-            state = secrets.token_urlsafe(24)  # internal CSRF state for IdP
+            state = secrets.token_urlsafe(24)
             original_params["client_state"] = client_state
             _LOGGER.debug(
                 "Using client-provided OAuth state: %s (internal state: %s)",
@@ -340,7 +364,7 @@ class OpenIDConsentView(HomeAssistantView):
             return _android_waiting_response(self.hass, url, client_state)
 
         _LOGGER.debug("Redirecting to IdP authorize endpoint after consent: %s", url)
-        return Response(status=302, headers={"Location": url})
+        return Response(status=HTTPStatus.FOUND, headers={"Location": url})
 
 
 class OpenIDCallbackView(HomeAssistantView):
@@ -354,7 +378,7 @@ class OpenIDCallbackView(HomeAssistantView):
         """Initialize the callback view."""
         self.hass = hass
 
-    async def get(self, request: Request) -> Response:
+    async def get(self, request: Request) -> Response:  # noqa: C901
         """Handle redirect from IdP, exchange code for tokens."""
         params = request.rel_url.query
         _LOGGER.debug("OpenIDCallbackView received callback params: %s", dict(params))
@@ -370,7 +394,6 @@ class OpenIDCallbackView(HomeAssistantView):
                 alert_message="OpenID login failed! Missing code or state parameter.",
             )
 
-        # Validate state
         _LOGGER.debug("Looking up state %s in _openid_state dict", state)
         _LOGGER.debug(
             "Available states in _openid_state: %s",
@@ -388,18 +411,23 @@ class OpenIDCallbackView(HomeAssistantView):
 
         _LOGGER.debug("Found pending data: %s", dict(pending))
 
-        # Preserve the original OAuth client's state BEFORE merging
-        # (Music Assistant and other OAuth clients send this)
         oauth_client_state = pending.get("client_state") or pending.get("state")
         _LOGGER.debug(
             "Original OAuth client state from pending: %s", oauth_client_state
         )
 
-        # Now merge params - this will overwrite 'state' with our internal state
         params = {**params, **pending}
         _LOGGER.debug("Merged params: %s", dict(params))
 
-        conf: dict[str, str] = self.hass.data[DOMAIN]
+        conf = get_active_config(self.hass)
+        if conf is None:
+            return _show_error(
+                self.hass,
+                params,
+                alert_type="error",
+                alert_message="OpenID login failed! Integration is not configured.",
+            )
+
         base_url = params.get("base_url", "")
         redirect_uri = str(URL(base_url).with_path("/auth/openid/callback"))
 
@@ -520,7 +548,7 @@ class OpenIDCallbackView(HomeAssistantView):
                     credential_data.setdefault("openid_groups_initialized", True)
                     user = existing_user
 
-        if user is None and self.hass.data[DOMAIN].get(CONF_CREATE_USER, False):
+        if user is None and conf.get(CONF_CREATE_USER, False):
             try:
                 user = await self.hass.auth.async_get_or_create_user(credentials)
             except ValueError as err:
@@ -585,7 +613,6 @@ class OpenIDCallbackView(HomeAssistantView):
         )
 
         url = params.get("redirect_uri", "/")
-
         result = create_auth_code(self.hass, client_id, credentials)
 
         _LOGGER.debug(
@@ -760,7 +787,7 @@ class OpenIDSessionView(HomeAssistantView):
 
     async def get(self, request: Request) -> Response:
         """Return logout configuration for the current user."""
-        conf: dict[str, Any] | None = self.hass.data.get(DOMAIN)
+        conf = get_active_config(self.hass)
         if not conf or not conf.get(CONF_LOGOUT_URL):
             return Response(status=HTTPStatus.NO_CONTENT)
 
@@ -799,8 +826,6 @@ class OpenIDSessionView(HomeAssistantView):
             if client_id := conf.get(CONF_CLIENT_ID):
                 params.setdefault("client_id", client_id)
 
-        # Always return the logout URL even if there are no additional parameters
-        # The frontend needs to redirect the user to the IdP logout page
         payload = {
             "logout_url": conf[CONF_LOGOUT_URL],
             "parameters": params,
@@ -867,13 +892,13 @@ class OpenIDAndroidStatusView(HomeAssistantView):
         )
 
 def _show_error(
-    hass: HomeAssistant,
+    hass,
     params: Mapping[str, str],
     alert_type: str,
     alert_message: str,
 ) -> Response:
-    # make sure the alert_type and alert_message can be safely displayed
-    conf: dict[str, Any] | None = hass.data.get(DOMAIN)
+    """Render the configured OpenID error response."""
+    conf = get_active_config(hass) or {}
     alert_type = alert_type.replace("'", "&#39;").replace('"', "&quot;")
     alert_message = alert_message.replace("'", "&#39;").replace('"', "&quot;")
     redirect_url = params.get("redirect_uri", "/").replace("auth_callback=1", "")
@@ -881,39 +906,18 @@ def _show_error(
 
     error_url = conf.get(CONF_ERROR_URL)
     if error_url is not None:
-        full_error_url = f"{error_url}?alert_type={quote(alert_type)}&alert_message={quote(alert_message)}"
-        return Response(status=HTTPStatus.FOUND, headers={"Location": full_error_url})
-    else:
-        template_content = hass.data[DOMAIN]["error_template"]
-        template = Template(template_content)
-        html = template.substitute(
-            alert_type=alert_type,
-            alert_message=alert_message,
-            redirect_url=safe_redirect_url,
+        full_error_url = (
+            f"{error_url}?alert_type={quote(alert_type)}"
+            f"&alert_message={quote(alert_message)}"
         )
+        return Response(status=HTTPStatus.FOUND, headers={"Location": full_error_url})
 
-    return Response(status=HTTPStatus.OK, content_type="text/html", text=html)
-
-
-def _android_waiting_response(
-    hass: HomeAssistant,
-    authorize_url: str,
-    poll_state: str,
-) -> Response:
-    """Return Android waiting page that polls for callback completion."""
-    safe_authorize_url = authorize_url.replace("'", "%27").replace('"', "%22")
-    safe_poll_state = poll_state.replace("'", "%27").replace('"', "%22")
-
-    template_content = hass.data[DOMAIN]["android_waiting_template"]
+    template_content = hass.data[DOMAIN]["error_template"]
     template = Template(template_content)
     html = template.substitute(
-        authorize_url=safe_authorize_url,
-        poll_state=safe_poll_state,
+        alert_type=alert_type,
+        alert_message=alert_message,
+        redirect_url=safe_redirect_url,
     )
 
     return Response(status=HTTPStatus.OK, content_type="text/html", text=html)
-
-
-def _is_android_client(client_id: str | None) -> bool:
-    """Return whether request is from Home Assistant Android client."""
-    return client_id == "https://home-assistant.io/android"

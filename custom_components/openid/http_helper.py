@@ -7,6 +7,7 @@ import json
 import logging
 from pathlib import Path
 import secrets
+from collections.abc import Callable
 from urllib.parse import urlencode
 
 from aiohttp.web import FileResponse, Request, Response
@@ -60,7 +61,7 @@ def _is_trusted_request(request: Request, config: dict) -> bool:
     return any(ip_obj in network for network in config.get(CONF_TRUSTED_IPS, []))
 
 
-def override_authorize_login_flow(hass: HomeAssistant) -> None:
+def override_authorize_login_flow(hass: HomeAssistant) -> Callable[[], None] | None:
     """Patch the built-in /auth/login_flow page to not return any actual login data."""
 
     _original_post_function = None
@@ -103,16 +104,26 @@ def override_authorize_login_flow(hass: HomeAssistant) -> None:
     for resource in hass.http.app.router._resources:  # noqa: SLF001
         if getattr(resource, "canonical", None) == "/auth/login_flow":
             post_handler = resource._routes.get("POST")  # noqa: SLF001
-            # Replace the underlying coroutine fn.
+            if post_handler is None:
+                return None
+            original_routes = dict(resource._routes)  # noqa: SLF001
             _original_post_function = post_handler._handler  # noqa: SLF001
             post_handler._handler = post  # noqa: SLF001
-            # Reset the routes map to ensure only our GET exists.
             resource._routes = {"POST": post_handler}  # noqa: SLF001
             _LOGGER.debug("Overrode /auth/login_flow route")
-            break
+
+            def restore() -> None:
+                post_handler._handler = _original_post_function  # noqa: SLF001
+                resource._routes = original_routes  # noqa: SLF001
+                _LOGGER.debug("Restored /auth/login_flow route")
+
+            return restore
+
+    _LOGGER.warning("Unable to find /auth/login_flow route to patch")
+    return None
 
 
-def override_authorize_route(hass: HomeAssistant) -> None:
+def override_authorize_route(hass: HomeAssistant) -> Callable[[], None] | None:
     """Patch the built-in /auth/authorize page to redirect to OpenID authorize with state preserved."""
 
     _original_get_function = None
@@ -233,10 +244,20 @@ def override_authorize_route(hass: HomeAssistant) -> None:
     for resource in hass.http.app.router._resources:  # noqa: SLF001
         if getattr(resource, "canonical", None) == "/auth/authorize":
             get_handler = resource._routes.get("GET")  # noqa: SLF001
-            # Replace the underlying coroutine fn.
+            if get_handler is None:
+                return None
+            original_routes = dict(resource._routes)  # noqa: SLF001
             _original_get_function = get_handler._handler  # noqa: SLF001
             get_handler._handler = get  # noqa: SLF001
-            # Reset the routes map to ensure only our GET exists.
             resource._routes = {"GET": get_handler}  # noqa: SLF001
             _LOGGER.debug("Overrode /auth/authorize route – custom JS injected")
-            break
+
+            def restore() -> None:
+                get_handler._handler = _original_get_function  # noqa: SLF001
+                resource._routes = original_routes  # noqa: SLF001
+                _LOGGER.debug("Restored /auth/authorize route")
+
+            return restore
+
+    _LOGGER.warning("Unable to find /auth/authorize route to patch")
+    return None
