@@ -34,27 +34,15 @@ def _read_file_content(path: Path) -> str:
 
 
 def _extract_request_ip(request: Request) -> RequestIP | None:
-    """Extract and parse the client IP from the request headers."""
-    remote_ip = request.headers.get("X-Forwarded-For", request.remote)
-    if not remote_ip:
+    """Return the client IP established by Home Assistant HTTP middleware."""
+    if not request.remote:
         return None
 
-    candidate = remote_ip.split(",", 1)[0].strip()
-    if not candidate:
-        return None
-
-    if candidate.startswith("[") and "]" in candidate:
-        candidate = candidate[1 : candidate.index("]")]
-
-    if candidate.count(":") == 1 and "." in candidate:
-        candidate = candidate.split(":", 1)[0]
-
-    if "%" in candidate:
-        candidate = candidate.split("%", 1)[0]
-
+    candidate = request.remote.split("%", 1)[0]
     try:
         return ip_address(candidate)
     except ValueError:
+        _LOGGER.warning("Unable to parse effective request IP")
         return None
 
 
