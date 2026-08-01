@@ -11,7 +11,8 @@
       "invalid_cidr": "Enter one valid CIDR block per line",
       "invalid_discovery": "The discovery endpoint did not return the required OpenID endpoints",
       "invalid_ssl_certificate": "TLS certificate validation failed while connecting to the provider",
-      "required_fields": "Review the discovered endpoints and fill in any missing values"
+      "required_fields": "Review the discovered endpoints and fill in any missing values",
+      "missing_oidc_metadata": "Issuer and JWKS URL are required when the requested scope includes openid"
     },
     "step": {
       "advanced": {
@@ -21,7 +22,8 @@
           "error_url": "Custom error redirect URL",
           "openid_text": "Login button text",
           "trusted_ips_input": "Trusted IPv4/IPv6 CIDR blocks",
-          "use_auth_header": "Use HTTP Basic auth for the token request"
+          "use_auth_header": "Use HTTP Basic auth for the token request",
+          "post_logout_url": "Post-logout redirect URL"
         },
         "data_description": {
           "block_login": "Only allow OpenID login unless the client IP matches one of the trusted IPv4 or IPv6 CIDR blocks below",
@@ -29,7 +31,8 @@
           "error_url": "Optional URL to redirect to instead of showing the built-in OpenID error page",
           "openid_text": "Text shown on the Home Assistant login page",
           "trusted_ips_input": "Enter one IPv4 or IPv6 CIDR block per line",
-          "use_auth_header": "Send the client ID and secret in the Authorization header when exchanging the code for tokens"
+          "use_auth_header": "Send the client ID and secret in the Authorization header when exchanging the code for tokens",
+          "post_logout_url": "Optional URL sent to the provider as post_logout_redirect_uri; leave blank to let the provider control the logout flow"
         },
         "description": "Configure the remaining login behavior and defaults."
       },
@@ -73,7 +76,10 @@
           "token_url": "Token endpoint",
           "use_pkce": "Use PKCE",
           "user_info_url": "User info endpoint",
-          "validate_tls": "Validate TLS certificate"
+          "validate_tls": "Validate TLS certificate",
+          "issuer": "Issuer",
+          "jwks_url": "JWKS endpoint",
+          "id_token_signing_algorithms_input": "ID token signing algorithms"
         },
         "data_description": {
           "authorize_url": "Authorization endpoint",
@@ -81,7 +87,10 @@
           "token_url": "Token endpoint",
           "use_pkce": "Whether the authorization flow should use PKCE",
           "user_info_url": "User info endpoint",
-          "validate_tls": "Verify the provider TLS certificate for discovery, token, and user info requests"
+          "validate_tls": "Verify the provider TLS certificate for discovery, token, and user info requests",
+          "issuer": "OIDC issuer identifier; required for manual OpenID configuration",
+          "jwks_url": "JWKS endpoint used to validate ID token signatures",
+          "id_token_signing_algorithms_input": "Comma-separated allowed algorithms, for example RS256 or ES256"
         },
         "description": "{pkce_message}"
       },

@@ -43,8 +43,9 @@ Keep your client ID and client secret ready before starting the integration flow
   - Set **Validate TLS certificate** to control whether the provider certificate is verified.
 4. Review and confirm provider endpoints:
   - Required: Authorization endpoint, Token endpoint, User info endpoint.
+  - When manual mode requests the `openid` scope, also enter the provider **Issuer** and **JWKS endpoint** used to validate ID tokens.
   - Optional: Logout endpoint.
-  - **Validate TLS certificate** applies to discovery, token, and user info requests.
+  - **Validate TLS certificate** applies to discovery, token, user info, and JWKS requests.
   - PKCE:
     - Discovery mode auto-detects PKCE (`S256`) support.
     - Manual mode lets you set PKCE explicitly.
@@ -59,6 +60,7 @@ Keep your client ID and client secret ready before starting the integration flow
   - **Create Home Assistant users automatically**
   - **Use HTTP Basic auth for the token request**
   - **Custom error redirect URL** (optional)
+  - **Post-logout redirect URL** (optional). Leave this blank unless your provider expects `post_logout_redirect_uri`; when blank, the provider controls the logout destination.
 8. Finish the flow, sign out, and verify the **OpenID / OAuth2** button works on the login page.
 
 To change settings later, open the OpenID integration card and use **Reconfigure**.

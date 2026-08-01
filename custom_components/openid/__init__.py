@@ -76,6 +76,11 @@ CONFIG_SCHEMA = vol.Schema(
                 vol.Optional(CONF_TOKEN_URL): cv.url,
                 vol.Optional(CONF_USER_INFO_URL): cv.url,
                 vol.Optional(CONF_CONFIGURE_URL): cv.url,
+                vol.Optional(CONF_ISSUER): cv.url,
+                vol.Optional(CONF_JWKS_URL): cv.url,
+                vol.Optional(CONF_ID_TOKEN_SIGNING_ALGORITHMS): vol.All(
+                    cv.ensure_list, [cv.string]
+                ),
                 vol.Optional(CONF_SCOPE, default=DEFAULT_SCOPE): cv.string,
                 vol.Optional(
                     CONF_USERNAME_FIELD, default=DEFAULT_USERNAME_FIELD
@@ -170,63 +175,63 @@ async def _async_prepare_config(
 ) -> dict[str, Any]:
     """Prepare raw config for runtime use."""
     config.setdefault(CONF_VALIDATE_TLS, DEFAULT_VALIDATE_TLS)
-
-    if CONF_CONFIGURE_URL not in config:
-        return config
-
     openid_requested = "openid" in config.get(CONF_SCOPE, DEFAULT_SCOPE).split()
-    needs_discovery = (
-        any(
-            not config.get(key)
-            for key in (CONF_AUTHORIZE_URL, CONF_TOKEN_URL, CONF_USER_INFO_URL)
-        )
-        or CONF_USE_PKCE not in config
-        or (
-            openid_requested
-            and any(
+
+    if CONF_CONFIGURE_URL in config:
+        needs_discovery = (
+            any(
                 not config.get(key)
-                for key in (
-                    CONF_ISSUER,
-                    CONF_JWKS_URL,
-                    CONF_ID_TOKEN_SIGNING_ALGORITHMS,
+                for key in (CONF_AUTHORIZE_URL, CONF_TOKEN_URL, CONF_USER_INFO_URL)
+            )
+            or CONF_USE_PKCE not in config
+            or (
+                openid_requested
+                and any(
+                    not config.get(key)
+                    for key in (
+                        CONF_ISSUER,
+                        CONF_JWKS_URL,
+                        CONF_ID_TOKEN_SIGNING_ALGORITHMS,
+                    )
                 )
             )
         )
-    )
-    if not needs_discovery:
-        return config
+        if needs_discovery:
+            discovered = await async_discover_configuration(
+                hass,
+                config[CONF_CONFIGURE_URL],
+                validate_tls=bool(
+                    config.get(CONF_VALIDATE_TLS, DEFAULT_VALIDATE_TLS)
+                ),
+            )
+            for key in (CONF_AUTHORIZE_URL, CONF_TOKEN_URL, CONF_USER_INFO_URL):
+                if not config.get(key) and discovered.get(key):
+                    config[key] = discovered[key]
 
-    discovered = await async_discover_configuration(
-        hass,
-        config[CONF_CONFIGURE_URL],
-        validate_tls=bool(config.get(CONF_VALIDATE_TLS, DEFAULT_VALIDATE_TLS)),
-    )
-    for key in (CONF_AUTHORIZE_URL, CONF_TOKEN_URL, CONF_USER_INFO_URL):
-        if key not in config and discovered.get(key):
-            config[key] = discovered[key]
+            if not config.get(CONF_LOGOUT_URL) and discovered.get(CONF_LOGOUT_URL):
+                config[CONF_LOGOUT_URL] = discovered[CONF_LOGOUT_URL]
 
-    if CONF_LOGOUT_URL not in config and discovered.get(CONF_LOGOUT_URL):
-        config[CONF_LOGOUT_URL] = discovered[CONF_LOGOUT_URL]
+            for key in (
+                CONF_ISSUER,
+                CONF_JWKS_URL,
+                CONF_ID_TOKEN_SIGNING_ALGORITHMS,
+            ):
+                if not config.get(key) and discovered.get(key):
+                    config[key] = discovered[key]
 
-    for key in (
-        CONF_ISSUER,
-        CONF_JWKS_URL,
-        CONF_ID_TOKEN_SIGNING_ALGORITHMS,
-    ):
-        if key not in config and discovered.get(key):
-            config[key] = discovered[key]
-
-    if CONF_USE_PKCE not in config:
-        config[CONF_USE_PKCE] = bool(discovered[DISCOVERY_PKCE_AVAILABLE])
+            if CONF_USE_PKCE not in config:
+                config[CONF_USE_PKCE] = bool(discovered[DISCOVERY_PKCE_AVAILABLE])
 
     required_keys = [CONF_AUTHORIZE_URL, CONF_TOKEN_URL, CONF_USER_INFO_URL]
     if openid_requested:
         required_keys.extend((CONF_ISSUER, CONF_JWKS_URL))
+        config.setdefault(CONF_ID_TOKEN_SIGNING_ALGORITHMS, ["RS256"])
 
     missing = [key for key in required_keys if not config.get(key)]
     if missing:
+        source = "discovery" if CONF_CONFIGURE_URL in config else "manual configuration"
         raise RuntimeError(
-            f"OpenID discovery did not provide required endpoints: {', '.join(missing)}"
+            f"OpenID {source} did not provide required values: {', '.join(missing)}"
         )
 
     return config

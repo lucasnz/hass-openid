@@ -584,7 +584,7 @@ class OpenIDCallbackView(HomeAssistantView):
         credential_data = dict(credentials.data)
         credential_data.update(new_credential_fields)
 
-        postlogout_url = conf.get(CONF_POST_LOGOUT_URL) or base_url
+        postlogout_url = conf.get(CONF_POST_LOGOUT_URL)
 
         self._store_logout_metadata(
             credential_data,
@@ -754,6 +754,8 @@ class OpenIDCallbackView(HomeAssistantView):
 
         if postlogout_redirect_url:
             credential_data[CRED_LOGOUT_REDIRECT_URI] = postlogout_redirect_url
+        else:
+            credential_data.pop(CRED_LOGOUT_REDIRECT_URI, None)
 
     async def _ensure_person_for_user(
         self, user: User, credential_data: dict[str, Any]
@@ -858,15 +860,8 @@ class OpenIDSessionView(HomeAssistantView):
         if session_state := credential.data.get(CRED_SESSION_STATE):
             params["session_state"] = session_state
 
-        redirect_uri = credential.data.get(CRED_LOGOUT_REDIRECT_URI)
-        if not redirect_uri:
-            try:
-                redirect_uri = get_url(self.hass)
-            except NoURLAvailableError:
-                redirect_uri = None
-
-        if redirect_uri:
-            params.setdefault("post_logout_redirect_uri", redirect_uri)
+        if redirect_uri := credential.data.get(CRED_LOGOUT_REDIRECT_URI):
+            params["post_logout_redirect_uri"] = redirect_uri
 
         if "id_token_hint" not in params and "session_state" not in params:
             if client_id := conf.get(CONF_CLIENT_ID):

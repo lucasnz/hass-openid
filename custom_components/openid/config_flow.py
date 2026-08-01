@@ -36,6 +36,7 @@ from .const import (
     CONF_JWKS_URL,
     CONF_LOGOUT_URL,
     CONF_OPENID_TEXT,
+    CONF_POST_LOGOUT_URL,
     CONF_SCOPE,
     CONF_TOKEN_URL,
     CONF_TRUSTED_IPS,
@@ -60,6 +61,7 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 CONF_TRUSTED_IPS_INPUT = "trusted_ips_input"
+CONF_ID_TOKEN_SIGNING_ALGORITHMS_INPUT = "id_token_signing_algorithms_input"
 
 TLS_DISCOVERY_EXCEPTIONS = (
     ClientConnectorCertificateError,
@@ -116,6 +118,7 @@ class OpenIDConfigFlow(ConfigFlow, domain=DOMAIN):
         self._config_data: dict[str, Any] = {}
         self._pkce_available = False
         self._pkce_availability_known = False
+        self._manual_mode = False
 
     def _get_existing_entry(self):
         """Return the existing OpenID config entry, if any."""
@@ -145,6 +148,7 @@ class OpenIDConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         if user_input is not None:
+            self._manual_mode = False
             validate_tls = bool(user_input.get(CONF_VALIDATE_TLS, DEFAULT_VALIDATE_TLS))
             try:
                 discovered = await async_discover_configuration(
@@ -245,30 +249,55 @@ class OpenIDConfigFlow(ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Skip discovery and enter endpoints manually."""
+        self._manual_mode = True
+        was_discovery = CONF_CONFIGURE_URL in self._config_data
         self._config_data.pop(CONF_CONFIGURE_URL, None)
+        if was_discovery:
+            for key in (
+                CONF_ISSUER,
+                CONF_JWKS_URL,
+                CONF_ID_TOKEN_SIGNING_ALGORITHMS,
+            ):
+                self._config_data.pop(key, None)
         self._config_data.setdefault(CONF_VALIDATE_TLS, DEFAULT_VALIDATE_TLS)
         self._pkce_availability_known = False
         self._pkce_available = bool(self._config_data.get(CONF_USE_PKCE, False))
-        return await self.async_step_provider(user_input)
+        return await self.async_step_identity(user_input)
 
     async def async_step_provider(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Edit discovered or manually entered provider endpoints."""
         errors: dict[str, str] = {}
+        openid_requested = "openid" in self._config_data.get(
+            CONF_SCOPE, DEFAULT_SCOPE
+        ).split()
 
         if user_input is not None:
+            required_fields = [
+                CONF_AUTHORIZE_URL,
+                CONF_TOKEN_URL,
+                CONF_USER_INFO_URL,
+            ]
+            if self._manual_mode and openid_requested:
+                required_fields.extend((CONF_ISSUER, CONF_JWKS_URL))
+
             missing_fields = [
                 field
-                for field in (
-                    CONF_AUTHORIZE_URL,
-                    CONF_TOKEN_URL,
-                    CONF_USER_INFO_URL,
-                )
-                if not user_input[field].strip()
+                for field in required_fields
+                if not str(user_input.get(field, "")).strip()
             ]
             if missing_fields:
-                errors["base"] = "required_fields"
+                errors["base"] = (
+                    "missing_oidc_metadata"
+                    if self._manual_mode
+                    and openid_requested
+                    and any(
+                        field in missing_fields
+                        for field in (CONF_ISSUER, CONF_JWKS_URL)
+                    )
+                    else "required_fields"
+                )
             else:
                 self._config_data.update(
                     {
@@ -280,11 +309,45 @@ class OpenIDConfigFlow(ConfigFlow, domain=DOMAIN):
                         ),
                     }
                 )
+
                 logout_url = user_input.get(CONF_LOGOUT_URL, "").strip()
                 if logout_url:
                     self._config_data[CONF_LOGOUT_URL] = logout_url
                 else:
                     self._config_data.pop(CONF_LOGOUT_URL, None)
+
+                if self._manual_mode:
+                    issuer = user_input.get(CONF_ISSUER, "").strip()
+                    jwks_url = user_input.get(CONF_JWKS_URL, "").strip()
+                    algorithms_input = user_input.get(
+                        CONF_ID_TOKEN_SIGNING_ALGORITHMS_INPUT, ""
+                    )
+                    algorithms = [
+                        value
+                        for chunk in algorithms_input.split(",")
+                        if (value := chunk.strip())
+                    ]
+
+                    if issuer:
+                        self._config_data[CONF_ISSUER] = issuer
+                    else:
+                        self._config_data.pop(CONF_ISSUER, None)
+
+                    if jwks_url:
+                        self._config_data[CONF_JWKS_URL] = jwks_url
+                    else:
+                        self._config_data.pop(CONF_JWKS_URL, None)
+
+                    if openid_requested:
+                        self._config_data[CONF_ID_TOKEN_SIGNING_ALGORITHMS] = (
+                            algorithms or ["RS256"]
+                        )
+                    elif algorithms:
+                        self._config_data[CONF_ID_TOKEN_SIGNING_ALGORITHMS] = algorithms
+                    else:
+                        self._config_data.pop(
+                            CONF_ID_TOKEN_SIGNING_ALGORITHMS, None
+                        )
 
                 self._config_data[CONF_USE_PKCE] = bool(
                     user_input.get(CONF_USE_PKCE, False)
@@ -292,6 +355,12 @@ class OpenIDConfigFlow(ConfigFlow, domain=DOMAIN):
                     else self._pkce_available and user_input.get(CONF_USE_PKCE, False)
                 )
                 return await self.async_step_credentials()
+
+        configured_algorithms = self._config_data.get(
+            CONF_ID_TOKEN_SIGNING_ALGORITHMS, ["RS256"]
+        )
+        if isinstance(configured_algorithms, str):
+            configured_algorithms = [configured_algorithms]
 
         suggested_values = user_input or {
             CONF_AUTHORIZE_URL: self._config_data.get(CONF_AUTHORIZE_URL, ""),
@@ -303,6 +372,16 @@ class OpenIDConfigFlow(ConfigFlow, domain=DOMAIN):
             ),
             CONF_USE_PKCE: self._config_data.get(CONF_USE_PKCE, False),
         }
+        if self._manual_mode and user_input is None:
+            suggested_values.update(
+                {
+                    CONF_ISSUER: self._config_data.get(CONF_ISSUER, ""),
+                    CONF_JWKS_URL: self._config_data.get(CONF_JWKS_URL, ""),
+                    CONF_ID_TOKEN_SIGNING_ALGORITHMS_INPUT: ", ".join(
+                        configured_algorithms
+                    ),
+                }
+            )
 
         if not self._pkce_availability_known:
             pkce_message = (
@@ -318,26 +397,41 @@ class OpenIDConfigFlow(ConfigFlow, domain=DOMAIN):
                 "PKCE (S256) is not advertised by this provider, so it cannot be enabled."
             )
 
+        schema: dict[Any, Any] = {
+            vol.Required(CONF_AUTHORIZE_URL): _url_selector(),
+            vol.Required(CONF_TOKEN_URL): _url_selector(),
+            vol.Required(CONF_USER_INFO_URL): _url_selector(),
+            vol.Optional(CONF_LOGOUT_URL): _url_selector(),
+        }
+        if self._manual_mode:
+            oidc_key = vol.Required if openid_requested else vol.Optional
+            schema.update(
+                {
+                    oidc_key(CONF_ISSUER): _url_selector(),
+                    oidc_key(CONF_JWKS_URL): _url_selector(),
+                    vol.Optional(
+                        CONF_ID_TOKEN_SIGNING_ALGORITHMS_INPUT
+                    ): _text_selector(),
+                }
+            )
+        schema.update(
+            {
+                vol.Required(CONF_VALIDATE_TLS): BooleanSelector(),
+                vol.Required(CONF_USE_PKCE): BooleanSelector(
+                    BooleanSelectorConfig(
+                        read_only=(
+                            self._pkce_availability_known
+                            and not self._pkce_available
+                        )
+                    )
+                ),
+            }
+        )
+
         return self.async_show_form(
             step_id="provider",
             data_schema=self.add_suggested_values_to_schema(
-                vol.Schema(
-                    {
-                        vol.Required(CONF_AUTHORIZE_URL): _url_selector(),
-                        vol.Required(CONF_TOKEN_URL): _url_selector(),
-                        vol.Required(CONF_USER_INFO_URL): _url_selector(),
-                        vol.Optional(CONF_LOGOUT_URL): _url_selector(),
-                        vol.Required(CONF_VALIDATE_TLS): BooleanSelector(),
-                        vol.Required(CONF_USE_PKCE): BooleanSelector(
-                            BooleanSelectorConfig(
-                                read_only=(
-                                    self._pkce_availability_known
-                                    and not self._pkce_available
-                                )
-                            )
-                        ),
-                    }
-                ),
+                vol.Schema(schema),
                 suggested_values,
             ),
             description_placeholders={"pkce_message": pkce_message},
@@ -355,6 +449,8 @@ class OpenIDConfigFlow(ConfigFlow, domain=DOMAIN):
                     CONF_CLIENT_SECRET: user_input[CONF_CLIENT_SECRET],
                 }
             )
+            if self._manual_mode:
+                return await self.async_step_advanced()
             return await self.async_step_identity()
 
         suggested_values = user_input or {
@@ -386,6 +482,8 @@ class OpenIDConfigFlow(ConfigFlow, domain=DOMAIN):
                     CONF_USERNAME_FIELD: user_input[CONF_USERNAME_FIELD].strip(),
                 }
             )
+            if self._manual_mode:
+                return await self.async_step_provider()
             return await self.async_step_advanced()
 
         suggested_values = user_input or {
@@ -436,6 +534,12 @@ class OpenIDConfigFlow(ConfigFlow, domain=DOMAIN):
                 else:
                     self._config_data.pop(CONF_ERROR_URL, None)
 
+                post_logout_url = user_input.get(CONF_POST_LOGOUT_URL, "").strip()
+                if post_logout_url:
+                    self._config_data[CONF_POST_LOGOUT_URL] = post_logout_url
+                else:
+                    self._config_data.pop(CONF_POST_LOGOUT_URL, None)
+
                 if self.source == SOURCE_RECONFIGURE:
                     return self.async_update_reload_and_abort(
                         self._get_reconfigure_entry(),
@@ -461,6 +565,7 @@ class OpenIDConfigFlow(ConfigFlow, domain=DOMAIN):
                 CONF_USE_HEADER_AUTH, DEFAULT_USE_HEADER_AUTH
             ),
             CONF_ERROR_URL: self._config_data.get(CONF_ERROR_URL, ""),
+            CONF_POST_LOGOUT_URL: self._config_data.get(CONF_POST_LOGOUT_URL, ""),
         }
 
         return self.async_show_form(
@@ -476,6 +581,7 @@ class OpenIDConfigFlow(ConfigFlow, domain=DOMAIN):
                         vol.Required(CONF_CREATE_USER): BooleanSelector(),
                         vol.Required(CONF_USE_HEADER_AUTH): BooleanSelector(),
                         vol.Optional(CONF_ERROR_URL): _url_selector(),
+                        vol.Optional(CONF_POST_LOGOUT_URL): _url_selector(),
                     }
                 ),
                 suggested_values,
