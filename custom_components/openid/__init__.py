@@ -123,6 +123,8 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             )
             _activate_runtime_patches(hass)
         except Exception as err:  # noqa: BLE001
+            set_active_config(hass, None)
+            _restore_runtime_patches(hass)
             _LOGGER.error("Failed to prepare YAML OpenID configuration: %s", err)
             return False
 
@@ -151,7 +153,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "OpenID provider discovery is not currently available"
             ) from err
     set_active_config(hass, runtime_config)
-    _activate_runtime_patches(hass)
+    try:
+        _activate_runtime_patches(hass)
+    except Exception as err:  # noqa: BLE001
+        set_active_config(hass, None)
+        raise ConfigEntryNotReady(
+            "OpenID is incompatible with the current Home Assistant authentication routes"
+        ) from err
     hass.data[DOMAIN][DATA_ACTIVE_ENTRY_ID] = entry.entry_id
     return True
 
@@ -238,7 +246,7 @@ async def _async_prepare_config(
 
 
 def _activate_runtime_patches(hass: HomeAssistant) -> None:
-    """Install runtime monkey patches while an OpenID config is active."""
+    """Install runtime monkey patches atomically while config is active."""
     domain_data = hass.data.setdefault(DOMAIN, {})
     if domain_data.get("_runtime_patches_active"):
         return
@@ -257,7 +265,9 @@ def _activate_runtime_patches(hass: HomeAssistant) -> None:
             cleared = True
 
         if cleared:
-            hass.auth.async_update_user_credentials_data(credential, dict(credential.data))
+            hass.auth.async_update_user_credentials_data(
+                credential, dict(credential.data)
+            )
 
     original_remove_refresh_token = hass.auth.async_remove_refresh_token
 
@@ -285,30 +295,60 @@ def _activate_runtime_patches(hass: HomeAssistant) -> None:
 
         original_remove_refresh_token(refresh_token)
 
-    hass.auth.async_remove_refresh_token = _patched_remove_refresh_token
+    restore_callbacks: list[Any] = []
+    try:
+        authorize_restore = override_authorize_route(hass)
+        if authorize_restore is None:
+            raise RuntimeError("Unable to patch /auth/authorize")
+        restore_callbacks.append(authorize_restore)
+
+        login_flow_restore = override_authorize_login_flow(hass)
+        if login_flow_restore is None:
+            raise RuntimeError("Unable to patch /auth/login_flow")
+        restore_callbacks.append(login_flow_restore)
+
+        hass.auth.async_remove_refresh_token = _patched_remove_refresh_token
+    except Exception:
+        for restore in reversed(restore_callbacks):
+            try:
+                restore()
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("Failed to roll back an OpenID route patch")
+        if hass.auth.async_remove_refresh_token is _patched_remove_refresh_token:
+            hass.auth.async_remove_refresh_token = original_remove_refresh_token
+        raise
+
     domain_data["_remove_refresh_token_original"] = original_remove_refresh_token
-    domain_data["_route_restore_callbacks"] = [
-        callback
-        for callback in (
-            override_authorize_route(hass),
-            override_authorize_login_flow(hass),
-        )
-        if callback is not None
-    ]
+    domain_data["_remove_refresh_token_patched"] = _patched_remove_refresh_token
+    domain_data["_route_restore_callbacks"] = restore_callbacks
     domain_data["_runtime_patches_active"] = True
 
 
 def _restore_runtime_patches(hass: HomeAssistant) -> None:
-    """Restore Home Assistant methods and routes patched by the integration."""
+    """Restore every Home Assistant method and route independently."""
     domain_data = hass.data.get(DOMAIN, {})
-    if not domain_data.pop("_runtime_patches_active", False):
+    was_active = domain_data.pop("_runtime_patches_active", False)
+    original = domain_data.pop("_remove_refresh_token_original", None)
+    patched = domain_data.pop("_remove_refresh_token_patched", None)
+    restore_callbacks = domain_data.pop("_route_restore_callbacks", [])
+
+    if not was_active and original is None and not restore_callbacks:
         return
 
-    if original := domain_data.pop("_remove_refresh_token_original", None):
-        hass.auth.async_remove_refresh_token = original
+    if original is not None:
+        if patched is None or hass.auth.async_remove_refresh_token is patched:
+            hass.auth.async_remove_refresh_token = original
+        else:
+            _LOGGER.warning(
+                "Home Assistant refresh-token handler changed after OpenID setup; "
+                "leaving the newer handler in place"
+            )
 
-    for restore in reversed(domain_data.pop("_route_restore_callbacks", [])):
-        restore()
+    for restore in reversed(restore_callbacks):
+        try:
+            restore()
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Failed to restore an OpenID route patch")
 
 
 async def _async_setup_shared(hass: HomeAssistant) -> None:
