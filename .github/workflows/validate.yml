@@ -1,4 +1,4 @@
-name: HACS Validate
+name: Validate
 
 on:
   push:
@@ -9,12 +9,29 @@ on:
 
 jobs:
   validate-hacs:
-    runs-on: 'ubuntu-latest'
+    runs-on: ubuntu-latest
     steps:
-      - uses: 'actions/checkout@v3'
+      - uses: actions/checkout@v4
       - name: HACS validation
-        uses: 'hacs/action@main'
+        uses: hacs/action@main
         with:
-          category: 'integration'
+          category: integration
       - name: Hassfest validation
         uses: home-assistant/actions/hassfest@master
+
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          cache: pip
+          cache-dependency-path: requirements_test.txt
+      - name: Install test requirements
+        run: python -m pip install --upgrade pip -r requirements_test.txt
+      - name: Run tests
+        run: >-
+          pytest -q
+          --cov=custom_components.openid
+          --cov-report=term-missing
