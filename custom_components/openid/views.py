@@ -13,7 +13,7 @@ import logging
 import secrets
 from string import Template
 from typing import Any
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit
 
 from aiohttp import ClientSession
 from aiohttp.web import Request, Response
@@ -84,6 +84,28 @@ async def _validate_client_request(
     if not client_id or not redirect_uri or not indieauth.verify_client_id(client_id):
         return False
     return await indieauth.verify_redirect_uri(hass, client_id, redirect_uri)
+
+
+def _url_origin(value: str | None) -> tuple[str, str, int] | None:
+    """Return a normalized HTTP(S) origin for an absolute URL."""
+    if not value:
+        return None
+
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"} or not hostname:
+        return None
+
+    if port is None:
+        port = 443 if scheme == "https" else 80
+
+    return scheme, hostname.rstrip(".").lower(), port
 
 
 def _generate_pkce_pair() -> tuple[str, str]:
@@ -162,11 +184,13 @@ class OpenIDAuthorizeView(HomeAssistantView):
         with suppress(NoURLAvailableError):
             cloud_url = get_url(self.hass, allow_internal=False, require_cloud=True)
 
-        if client_id is not None and (
-            (external_url and client_id.startswith(external_url))
-            or (internal_url and client_id.startswith(internal_url))
-            or (cloud_url and client_id.startswith(cloud_url))
-        ):
+        client_origin = _url_origin(client_id)
+        trusted_origins = {
+            origin
+            for url in (external_url, internal_url, cloud_url)
+            if (origin := _url_origin(url)) is not None
+        }
+        if client_origin is not None and client_origin in trusted_origins:
             _LOGGER.debug(
                 "Request from Home Assistant frontend detected; skipping consent screen"
             )
