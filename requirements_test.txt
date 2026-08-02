@@ -1,2 +1,3 @@
 pytest-homeassistant-custom-component==0.13.340
+home-assistant-frontend==20260527.7
 pytest-cov==7.1.0

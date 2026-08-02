@@ -7,6 +7,7 @@
   "config_flow": true,
   "dependencies": [
     "auth",
+    "frontend",
     "http"
   ],
   "documentation": "https://github.com/cavefire/hass-openid",
