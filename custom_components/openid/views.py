@@ -30,6 +30,7 @@ from homeassistant.helpers.network import NoURLAvailableError, get_url
 from homeassistant.util import slugify
 
 from .config_helpers import get_active_config
+from .identity import normalize_username
 from .const import (
     CONF_AUTHORIZE_URL,
     CONF_BLOCK_LOGIN,
@@ -559,15 +560,24 @@ class OpenIDCallbackView(HomeAssistantView):
                 alert_message="OpenID login failed! Could not exchange code for tokens or fetch user info.",
             )
 
-        username = user_info.get(conf[CONF_USERNAME_FIELD]) if user_info else None
-
-        if not username:
-            _LOGGER.warning("No username found in user info")
+        username_field = conf[CONF_USERNAME_FIELD]
+        raw_username = user_info.get(username_field) if user_info else None
+        try:
+            username = normalize_username(raw_username)
+        except ValueError as err:
+            _LOGGER.warning(
+                "Invalid username claim %s: %s",
+                username_field,
+                err,
+            )
             return _show_error(
                 self.hass,
                 params,
                 alert_type="error",
-                alert_message="OpenID login failed! No username found in user info.",
+                alert_message=(
+                    "OpenID login failed! The configured username claim is "
+                    "missing, empty, or not a string."
+                ),
             )
 
         provider = self.hass.data[DOMAIN].get("auth_provider")
@@ -622,7 +632,24 @@ class OpenIDCallbackView(HomeAssistantView):
         )
 
         if user is None and (username_value := credential_data.get("username")):
-            existing_user = await self._async_find_user_by_username(username_value)
+            try:
+                existing_user = await self._async_find_user_by_username(username_value)
+            except ValueError as err:
+                _LOGGER.warning(
+                    "Refusing ambiguous username match for %s: %s",
+                    username_value,
+                    err,
+                )
+                return _show_error(
+                    self.hass,
+                    params,
+                    alert_type="error",
+                    alert_message=(
+                        "OpenID login failed! More than one Home Assistant account "
+                        "has credentials matching this username."
+                    ),
+                )
+
             if existing_user is not None:
                 try:
                     if credentials.is_new:
@@ -830,19 +857,39 @@ class OpenIDCallbackView(HomeAssistantView):
             _LOGGER.warning("Unable to create person for user %s: %s", user.id, err)
 
     async def _async_find_user_by_username(self, username: str) -> User | None:
-        """Return existing user matching username if available."""
-        username_lower = username.lower()
-        for candidate in await self.hass.auth.async_get_users():
-            if candidate.name and candidate.name.lower() == username_lower:
-                return candidate
+        """Return the single user whose credential username matches."""
+        normalized_username = normalize_username(username)
+        openid_matches: dict[str, User] = {}
+        other_matches: dict[str, User] = {}
 
+        for candidate in await self.hass.auth.async_get_users():
             for existing_credentials in candidate.credentials:
-                stored_username = existing_credentials.data.get("username")
-                if (
-                    isinstance(stored_username, str)
-                    and stored_username.lower() == username_lower
-                ):
-                    return candidate
+                try:
+                    stored_username = normalize_username(
+                        existing_credentials.data.get("username")
+                    )
+                except ValueError:
+                    continue
+
+                if stored_username != normalized_username:
+                    continue
+
+                matches = (
+                    openid_matches
+                    if existing_credentials.auth_provider_type == DOMAIN
+                    else other_matches
+                )
+                matches[candidate.id] = candidate
+
+        if len(openid_matches) > 1:
+            raise ValueError("multiple OpenID credentials match the username")
+        if openid_matches:
+            return next(iter(openid_matches.values()))
+
+        if len(other_matches) > 1:
+            raise ValueError("multiple non-OpenID credentials match the username")
+        if other_matches:
+            return next(iter(other_matches.values()))
 
         return None
 

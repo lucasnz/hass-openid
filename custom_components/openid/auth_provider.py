@@ -24,6 +24,7 @@ from homeassistant.auth.providers import (
 from homeassistant.core import HomeAssistant
 
 from .const import DOMAIN
+from .identity import normalize_username
 
 OPENID_AUTH_PROVIDER_SCHEMA = AUTH_PROVIDER_SCHEMA.extend({}, extra=vol.ALLOW_EXTRA)
 
@@ -59,20 +60,31 @@ class OpenIDAuthProvider(AuthProvider):
         self, flow_result: Mapping[str, str]
     ) -> Credentials:
         """Return existing credentials or create new ones for username."""
-        username = flow_result.get("username")
-        if not username:
-            raise ValueError("Username missing from flow result")
+        username = normalize_username(flow_result.get("username"))
+        credential_data = dict(flow_result)
+        credential_data["username"] = username
 
-        username_lower = username.lower()
-
+        matches: list[Credentials] = []
         for credentials in await self.async_credentials():
-            stored_username = credentials.data.get("username")
-            if stored_username and stored_username.lower() == username_lower:
-                credentials.data.update(flow_result)
-                credentials.is_new = False
-                return credentials
+            try:
+                stored_username = normalize_username(
+                    credentials.data.get("username")
+                )
+            except ValueError:
+                continue
 
-        return self.async_create_credentials(dict(flow_result))
+            if stored_username == username:
+                matches.append(credentials)
+
+        if len(matches) > 1:
+            raise ValueError("Multiple OpenID credentials match the username")
+        if matches:
+            credentials = matches[0]
+            credentials.data.update(credential_data)
+            credentials.is_new = False
+            return credentials
+
+        return self.async_create_credentials(credential_data)
 
     async def async_user_meta_for_credentials(
         self, credentials: Credentials
