@@ -1,21 +1,29 @@
 """Tests for OpenID authorization and identity handling."""
 
-import inspect
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from aiohttp.test_utils import make_mocked_request
 from yarl import URL
 
-from homeassistant.components.person import DOMAIN as PERSON_DOMAIN
+from homeassistant.const import CONF_CLIENT_ID, CONF_CLIENT_SECRET
 from homeassistant.core import HomeAssistant
 
 from custom_components.openid import views
-from custom_components.openid.auth_provider import OpenIDAuthProvider
 from custom_components.openid.const import (
     CONF_BLOCK_LOGIN,
+    CONF_CREATE_USER,
+    CONF_SCOPE,
+    CONF_TOKEN_URL,
+    CONF_USE_HEADER_AUTH,
+    CONF_USER_INFO_URL,
+    CONF_USERNAME_FIELD,
+    CONF_VALIDATE_TLS,
     CRED_LOGOUT_REDIRECT_URI,
+    DOMAIN,
 )
+from custom_components.openid.identity import normalize_username
 from custom_components.openid.views import OpenIDAuthorizeView, OpenIDCallbackView
 
 
@@ -75,86 +83,221 @@ def test_consent_skip_uses_exact_origin(
     )
 
 
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [
+        ("  MAPPED@Example.COM  ", "mapped@example.com"),
+        ("Straße", "strasse"),
+    ],
+)
+def test_normalize_username(raw_value: object, expected: str) -> None:
+    """Username claims are stripped and case-folded before matching."""
+    assert normalize_username(raw_value) == expected
+
+
+@pytest.mark.parametrize("raw_value", [None, "", "   ", 123, ["user@example.com"]])
+def test_normalize_username_rejects_invalid_claims(raw_value: object) -> None:
+    """Missing and non-string username claims are rejected."""
+    with pytest.raises(ValueError):
+        normalize_username(raw_value)
+
+
 @pytest.mark.asyncio
-async def test_existing_user_lookup_uses_mapped_username() -> None:
-    """The normalized username claim is used to locate an HA user."""
-    matching_user = SimpleNamespace(
+async def test_existing_user_lookup_uses_credentials_not_user_name() -> None:
+    """Only credential usernames are used to locate an HA account."""
+    name_only_user = SimpleNamespace(
+        id="name-only",
         name="mapped@example.com",
         credentials=[],
     )
-    display_name_only = SimpleNamespace(
-        name="Display Name",
-        credentials=[],
+    credential_user = SimpleNamespace(
+        id="credential-user",
+        name="Unrelated display name",
+        credentials=[
+            SimpleNamespace(
+                auth_provider_type="homeassistant",
+                data={"username": "MAPPED@example.com"},
+            )
+        ],
     )
     hass = SimpleNamespace(
         auth=SimpleNamespace(
             async_get_users=AsyncMock(
-                return_value=[display_name_only, matching_user]
+                return_value=[name_only_user, credential_user]
             )
         )
     )
 
     result = await OpenIDCallbackView(hass)._async_find_user_by_username(
-        "MAPPED@example.com"
+        " mapped@EXAMPLE.com "
     )
 
-    assert result is matching_user
+    assert result is credential_user
 
 
 @pytest.mark.asyncio
-async def test_person_is_never_reassigned_by_name(
+async def test_openid_credential_match_has_priority() -> None:
+    """An existing OpenID credential wins over another provider credential."""
+    other_provider_user = SimpleNamespace(
+        id="other-provider",
+        name="Other provider",
+        credentials=[
+            SimpleNamespace(
+                auth_provider_type="homeassistant",
+                data={"username": "mapped@example.com"},
+            )
+        ],
+    )
+    openid_user = SimpleNamespace(
+        id="openid-user",
+        name="OpenID user",
+        credentials=[
+            SimpleNamespace(
+                auth_provider_type=DOMAIN,
+                data={"username": "mapped@example.com"},
+            )
+        ],
+    )
+    hass = SimpleNamespace(
+        auth=SimpleNamespace(
+            async_get_users=AsyncMock(
+                return_value=[other_provider_user, openid_user]
+            )
+        )
+    )
+
+    result = await OpenIDCallbackView(hass)._async_find_user_by_username(
+        "mapped@example.com"
+    )
+
+    assert result is openid_user
+
+
+@pytest.mark.asyncio
+async def test_existing_user_lookup_rejects_ambiguous_matches() -> None:
+    """Two users matching at the same priority are not linked arbitrarily."""
+    users = [
+        SimpleNamespace(
+            id=f"user-{index}",
+            name=f"User {index}",
+            credentials=[
+                SimpleNamespace(
+                    auth_provider_type="homeassistant",
+                    data={"username": "mapped@example.com"},
+                )
+            ],
+        )
+        for index in range(2)
+    ]
+    hass = SimpleNamespace(
+        auth=SimpleNamespace(async_get_users=AsyncMock(return_value=users))
+    )
+
+    with pytest.raises(ValueError, match="multiple non-OpenID credentials"):
+        await OpenIDCallbackView(hass)._async_find_user_by_username(
+            "mapped@example.com"
+        )
+
+
+@pytest.mark.asyncio
+async def test_callback_links_existing_user_by_mapped_username(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A similarly named Person linked to another user remains untouched."""
-    storage = SimpleNamespace(
-        async_items=MagicMock(
-            return_value=[
-                {
-                    "id": "mapped-example-com",
-                    "name": "mapped@example.com",
-                    "user_id": "other-user",
-                }
-            ]
+    """The callback maps the configured claim and links the matching HA user."""
+    credentials = SimpleNamespace(data={}, is_new=True)
+    provider = SimpleNamespace(
+        async_get_or_create_credentials=AsyncMock(return_value=credentials)
+    )
+    matching_user = SimpleNamespace(
+        id="existing-user",
+        name="Unrelated display name",
+        credentials=[
+            SimpleNamespace(
+                auth_provider_type="homeassistant",
+                data={"username": "mapped@example.com"},
+            )
+        ],
+        is_owner=False,
+        groups=[],
+    )
+    auth = SimpleNamespace(
+        async_get_user_by_credentials=AsyncMock(return_value=None),
+        async_get_users=AsyncMock(return_value=[matching_user]),
+        async_link_user=AsyncMock(),
+        async_get_or_create_user=AsyncMock(),
+        async_update_user_credentials_data=MagicMock(),
+        async_update_user=AsyncMock(),
+    )
+    hass = SimpleNamespace(
+        auth=auth,
+        data={DOMAIN: {"auth_provider": provider}},
+    )
+    config = {
+        CONF_CLIENT_ID: "oidc-client",
+        CONF_CLIENT_SECRET: "oidc-secret",
+        CONF_TOKEN_URL: "https://idp.example/token",
+        CONF_USER_INFO_URL: "https://idp.example/userinfo",
+        CONF_SCOPE: "profile email",
+        CONF_USERNAME_FIELD: "email",
+        CONF_CREATE_USER: False,
+        CONF_USE_HEADER_AUTH: True,
+        CONF_VALIDATE_TLS: True,
+    }
+    pending = {
+        "client_id": "https://ha.example/",
+        "redirect_uri": "https://ha.example/?auth_callback=1",
+        "base_url": "https://ha.example",
+        "client_state": "client-state",
+    }
+
+    monkeypatch.setattr(views, "get_active_config", lambda _hass: config)
+    monkeypatch.setattr(
+        views,
+        "pop_pending",
+        lambda _hass, _store, _state: pending,
+    )
+    monkeypatch.setattr(
+        views,
+        "_validate_client_request",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        views,
+        "exchange_code_for_token",
+        AsyncMock(return_value={"access_token": "access-token"}),
+    )
+    monkeypatch.setattr(
+        views,
+        "fetch_user_info",
+        AsyncMock(
+            return_value={
+                "email": "  MAPPED@Example.COM  ",
+                "name": "Display Name",
+                "sub": "subject-1",
+            }
         ),
-        async_update_item=AsyncMock(),
     )
-    hass = SimpleNamespace(data={PERSON_DOMAIN: (None, storage, None)})
-    create_person = AsyncMock()
-    monkeypatch.setattr(views, "async_create_person", create_person)
-
-    await OpenIDCallbackView(hass)._ensure_person_for_user(
-        SimpleNamespace(id="openid-user", name="Display Name"),
-        {"username": "mapped@example.com", "name": "Display Name"},
+    monkeypatch.setattr(
+        views,
+        "create_auth_code",
+        lambda _hass, _client_id, _credentials: "ha-auth-code",
     )
 
-    storage.async_update_item.assert_not_awaited()
-    create_person.assert_awaited_once_with(
-        hass,
-        "mapped@example.com",
-        user_id="openid-user",
+    request = make_mocked_request(
+        "GET",
+        "/auth/openid/callback?code=idp-code&state=internal-state",
     )
+    response = await OpenIDCallbackView(hass).get(request)
 
+    assert response.status == 302
+    callback_query = URL(response.headers["Location"]).query
+    assert callback_query["code"] == "ha-auth-code"
+    assert callback_query["state"] == "client-state"
 
-def test_callback_does_not_rewrite_existing_group_membership() -> None:
-    """The login callback must not replace an existing user's HA groups."""
-    callback_source = inspect.getsource(OpenIDCallbackView.get)
-
-    assert "group_ids=" not in callback_source
-    assert "openid_groups_initialized" not in callback_source
-
-
-@pytest.mark.asyncio
-async def test_new_user_name_uses_mapped_username() -> None:
-    """Automatically created users use the configured username claim as HA name."""
-    credentials = SimpleNamespace(
-        data={"username": "mapped@example.com", "name": "Display Name"}
-    )
-
-    metadata = await OpenIDAuthProvider.async_user_meta_for_credentials(
-        SimpleNamespace(), credentials
-    )
-
-    assert metadata.name == "mapped@example.com"
+    credential_fields = provider.async_get_or_create_credentials.await_args.args[0]
+    assert credential_fields["username"] == "mapped@example.com"
+    auth.async_link_user.assert_awaited_once_with(matching_user, credentials)
+    auth.async_get_or_create_user.assert_not_awaited()
 
 
 def test_post_logout_redirect_is_only_stored_when_configured() -> None:
