@@ -10,6 +10,7 @@ from typing import Any
 import hass_frontend
 import voluptuous as vol
 
+from homeassistant.auth import InvalidAuthError, InvalidProvider
 from homeassistant.auth.models import Credentials
 from homeassistant.components.frontend import add_extra_js_url
 from homeassistant.components.http import StaticPathConfig
@@ -270,6 +271,7 @@ def _activate_runtime_patches(hass: HomeAssistant) -> None:
             )
 
     original_remove_refresh_token = hass.auth.async_remove_refresh_token
+    original_create_access_token = hass.auth.async_create_access_token
 
     def _patched_remove_refresh_token(refresh_token: Any) -> None:
         credential = getattr(refresh_token, "credential", None)
@@ -295,6 +297,37 @@ def _activate_runtime_patches(hass: HomeAssistant) -> None:
 
         original_remove_refresh_token(refresh_token)
 
+    def _patched_create_access_token(
+        refresh_token: Any,
+        remote_ip: str | None = None,
+    ) -> str:
+        """Reject and revoke tokens whose original auth provider was removed."""
+        try:
+            return original_create_access_token(refresh_token, remote_ip)
+        except InvalidProvider as err:
+            credential = getattr(refresh_token, "credential", None)
+            provider_type = getattr(credential, "auth_provider_type", None)
+            provider_id = getattr(credential, "auth_provider_id", None)
+            _LOGGER.warning(
+                "Removing stale refresh token for unavailable auth provider %s, %s",
+                provider_type,
+                provider_id,
+            )
+            try:
+                # Bypass the OpenID logout wrapper. There is no available provider
+                # to notify, and this token must be removed before the next retry.
+                original_remove_refresh_token(refresh_token)
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception(
+                    "Failed to remove stale refresh token for unavailable provider"
+                )
+
+            # TokenView converts InvalidAuthError into HTTP 403. This tells the
+            # client that the stored refresh token is no longer usable.
+            raise InvalidAuthError(
+                "Authentication provider is no longer available; sign in again"
+            ) from err
+
     restore_callbacks: list[Any] = []
     try:
         authorize_restore = override_authorize_route(hass)
@@ -308,6 +341,7 @@ def _activate_runtime_patches(hass: HomeAssistant) -> None:
         restore_callbacks.append(login_flow_restore)
 
         hass.auth.async_remove_refresh_token = _patched_remove_refresh_token
+        hass.auth.async_create_access_token = _patched_create_access_token
     except Exception:
         for restore in reversed(restore_callbacks):
             try:
@@ -316,10 +350,14 @@ def _activate_runtime_patches(hass: HomeAssistant) -> None:
                 _LOGGER.exception("Failed to roll back an OpenID route patch")
         if hass.auth.async_remove_refresh_token is _patched_remove_refresh_token:
             hass.auth.async_remove_refresh_token = original_remove_refresh_token
+        if hass.auth.async_create_access_token is _patched_create_access_token:
+            hass.auth.async_create_access_token = original_create_access_token
         raise
 
     domain_data["_remove_refresh_token_original"] = original_remove_refresh_token
     domain_data["_remove_refresh_token_patched"] = _patched_remove_refresh_token
+    domain_data["_create_access_token_original"] = original_create_access_token
+    domain_data["_create_access_token_patched"] = _patched_create_access_token
     domain_data["_route_restore_callbacks"] = restore_callbacks
     domain_data["_runtime_patches_active"] = True
 
@@ -328,16 +366,38 @@ def _restore_runtime_patches(hass: HomeAssistant) -> None:
     """Restore every Home Assistant method and route independently."""
     domain_data = hass.data.get(DOMAIN, {})
     was_active = domain_data.pop("_runtime_patches_active", False)
-    original = domain_data.pop("_remove_refresh_token_original", None)
-    patched = domain_data.pop("_remove_refresh_token_patched", None)
+    original_remove = domain_data.pop("_remove_refresh_token_original", None)
+    patched_remove = domain_data.pop("_remove_refresh_token_patched", None)
+    original_create = domain_data.pop("_create_access_token_original", None)
+    patched_create = domain_data.pop("_create_access_token_patched", None)
     restore_callbacks = domain_data.pop("_route_restore_callbacks", [])
 
-    if not was_active and original is None and not restore_callbacks:
+    if (
+        not was_active
+        and original_remove is None
+        and original_create is None
+        and not restore_callbacks
+    ):
         return
 
-    if original is not None:
-        if patched is None or hass.auth.async_remove_refresh_token is patched:
-            hass.auth.async_remove_refresh_token = original
+    if original_create is not None:
+        if (
+            patched_create is None
+            or hass.auth.async_create_access_token is patched_create
+        ):
+            hass.auth.async_create_access_token = original_create
+        else:
+            _LOGGER.warning(
+                "Home Assistant access-token handler changed after OpenID setup; "
+                "leaving the newer handler in place"
+            )
+
+    if original_remove is not None:
+        if (
+            patched_remove is None
+            or hass.auth.async_remove_refresh_token is patched_remove
+        ):
+            hass.auth.async_remove_refresh_token = original_remove
         else:
             _LOGGER.warning(
                 "Home Assistant refresh-token handler changed after OpenID setup; "
