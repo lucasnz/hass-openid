@@ -6,16 +6,12 @@
     <title>Sign in error</title>
     <link rel="stylesheet" href="/openid/style.css" />
   </head>
-  <body>
+  <body data-alert-type="$alert_type" data-alert-message="$alert_message">
     <div class="page-card">
       <h1>$alert_type</h1>
       <p class="message">$alert_message</p>
-      <p class="message">Redirecting to your application…</p>
-      <p><a class="inline-link" href="$redirect_url">Continue manually</a></p>
+      <p><a class="inline-link" href="$redirect_url">Start a new sign-in</a></p>
     </div>
-    <script>
-      localStorage.setItem('alertType', '$alert_type');
-      localStorage.setItem('alertMessage', '$alert_message');
-    </script>
+    <script src="/openid/error.js"></script>
   </body>
 </html>

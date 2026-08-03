@@ -453,6 +453,16 @@ async def _async_setup_shared(hass: HomeAssistant) -> None:
                 cache_headers=False,
             ),
             StaticPathConfig(
+                "/openid/android-waiting.js",
+                str(Path(__file__).parent / "android-waiting.js"),
+                cache_headers=False,
+            ),
+            StaticPathConfig(
+                "/openid/error.js",
+                str(Path(__file__).parent / "error.js"),
+                cache_headers=False,
+            ),
+            StaticPathConfig(
                 "/openid/style.css",
                 str(Path(__file__).parent / "style.css"),
                 cache_headers=True,
@@ -460,7 +470,7 @@ async def _async_setup_shared(hass: HomeAssistant) -> None:
             StaticPathConfig(
                 "/openid/logout.js",
                 str(Path(__file__).parent / "logout.js"),
-                cache_headers=True,
+                cache_headers=False,
             ),
         ]
     )

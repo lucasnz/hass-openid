@@ -14,6 +14,12 @@ ANDROID_STATE_STORE = "_openid_android_callbacks"
 AUTH_STATE_TTL = 10 * 60
 ANDROID_STATE_TTL = 15 * 60
 MAX_PENDING_ENTRIES = 256
+MAX_STATE_KEY_LENGTH = 512
+
+
+class StateStoreFull(RuntimeError):
+    """Raised when no more pending authentication states can be accepted."""
+
 
 
 def _cleanup(store: dict[str, dict[str, Any]], ttl: float) -> None:
@@ -32,16 +38,15 @@ def store_pending(
     *,
     ttl: float = AUTH_STATE_TTL,
 ) -> None:
-    """Store a bounded pending entry."""
+    """Store a bounded pending entry without evicting an active flow."""
+    if not key or len(key) > MAX_STATE_KEY_LENGTH:
+        raise ValueError("state key is missing or too long")
+
     store: dict[str, dict[str, Any]] = hass.data.setdefault(store_name, {})
     _cleanup(store, ttl)
 
-    if len(store) >= MAX_PENDING_ENTRIES:
-        oldest_key = min(
-            store,
-            key=lambda candidate: store[candidate].get("created_at", 0.0),
-        )
-        store.pop(oldest_key, None)
+    if key not in store and len(store) >= MAX_PENDING_ENTRIES:
+        raise StateStoreFull("too many authentication requests are pending")
 
     store[key] = {"created_at": monotonic(), "value": dict(value)}
 

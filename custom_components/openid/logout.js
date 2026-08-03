@@ -5,13 +5,15 @@ let handlingLogout = false;
 const findHass = () => document.querySelector("home-assistant")?.hass;
 
 const waitForHass = async () => {
-  while (true) {
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
     const hass = findHass();
     if (hass?.auth) {
       return hass;
     }
     await new Promise((resolve) => window.setTimeout(resolve, 250));
   }
+  return null;
 };
 
 const loadLogoutSession = async (hass) => {
@@ -89,6 +91,9 @@ const performLogout = async (hass, redirectUrl) => {
 
 const initializeLogoutOverride = async () => {
   const hass = await waitForHass();
+  if (!hass) {
+    return;
+  }
   const metadata = await loadLogoutSession(hass);
   const redirectUrl = buildLogoutUrl(metadata);
 
