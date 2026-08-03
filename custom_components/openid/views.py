@@ -54,12 +54,14 @@ from .const import (
     DOMAIN,
 )
 from .oauth_helper import exchange_code_for_token, fetch_user_info
+from .http_security import html_response, json_response, redirect_response
 from .oidc_helper import async_validate_id_token
 from .state_store import (
     ANDROID_STATE_STORE,
     ANDROID_STATE_TTL,
     AUTH_STATE_STORE,
     CONSENT_STATE_STORE,
+    StateStoreFull,
     get_pending,
     pop_pending,
     store_pending,
@@ -69,6 +71,9 @@ _LOGGER = logging.getLogger(__name__)
 
 _PKCE_VERIFIER_KEY = "pkce_code_verifier"
 _OIDC_NONCE_KEY = "oidc_nonce"
+_ANDROID_TRANSACTION_KEY = "android_transaction_id"
+_ANDROID_POLL_COOKIE = "openid_android_poll"
+_ALLOWED_PROMPTS = {"login", "consent", "select_account"}
 
 
 def _short_id(value: str | None) -> str:
@@ -117,28 +122,151 @@ def _generate_pkce_pair() -> tuple[str, str]:
     return code_verifier, code_challenge
 
 
+def _configured_callback_base_url(hass: HomeAssistant) -> str:
+    """Return a Home Assistant configured URL for the provider callback."""
+    with suppress(NoURLAvailableError):
+        return get_url(
+            hass,
+            allow_internal=False,
+            allow_external=True,
+            prefer_external=True,
+        )
+
+    return get_url(
+        hass,
+        allow_internal=True,
+        allow_external=False,
+        allow_cloud=False,
+    )
+
+
 def _android_waiting_response(
     hass: HomeAssistant,
+    request: Request,
     authorize_url: str,
-    poll_state: str,
+    transaction_id: str,
+    poll_secret: str,
 ) -> Response:
     """Return Android waiting page that polls for callback completion."""
-    safe_authorize_url = authorize_url.replace("'", "%27").replace('"', "%22")
-    safe_poll_state = poll_state.replace("'", "%27").replace('"', "%22")
-
     template_content = hass.data[DOMAIN]["android_waiting_template"]
     template = Template(template_content)
     html = template.substitute(
-        authorize_url=safe_authorize_url,
-        poll_state=safe_poll_state,
+        authorize_url=escape(authorize_url, quote=True),
+        transaction_id=escape(transaction_id, quote=True),
     )
-
-    return Response(status=HTTPStatus.OK, content_type="text/html", text=html)
+    response = html_response(html)
+    response.set_cookie(
+        _ANDROID_POLL_COOKIE,
+        poll_secret,
+        max_age=ANDROID_STATE_TTL,
+        httponly=True,
+        secure=request.secure,
+        samesite="Lax",
+        path="/auth/openid/android/status",
+    )
+    return response
 
 
 def _is_android_client(client_id: str | None) -> bool:
     """Return whether request is from the Home Assistant Android client."""
     return client_id == "https://home-assistant.io/android"
+
+
+async def _begin_provider_authorization(
+    hass: HomeAssistant,
+    request: Request,
+    params: Mapping[str, str],
+    conf: Mapping[str, Any],
+) -> Response:
+    """Create a server-side transaction and redirect to the provider."""
+    stored_params = dict(params)
+    client_id = stored_params.get("client_id")
+    client_state = stored_params.get("client_state") or stored_params.get("state")
+    if client_state:
+        stored_params["client_state"] = client_state
+
+    try:
+        base_url = _configured_callback_base_url(hass)
+    except NoURLAvailableError:
+        return html_response(
+            "Home Assistant has no configured internal or external URL",
+            status=HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+
+    stored_params["base_url"] = base_url
+    redirect_uri = str(URL(base_url).with_path("/auth/openid/callback"))
+    internal_state = secrets.token_urlsafe(32)
+    query: dict[str, str] = {
+        "response_type": "code",
+        "client_id": conf[CONF_CLIENT_ID],
+        "redirect_uri": redirect_uri,
+        "scope": conf.get(CONF_SCOPE, ""),
+        "state": internal_state,
+    }
+
+    prompt = stored_params.get("prompt")
+    if prompt in _ALLOWED_PROMPTS:
+        query["prompt"] = prompt
+
+    if "openid" in conf.get(CONF_SCOPE, "").split():
+        nonce = secrets.token_urlsafe(32)
+        stored_params[_OIDC_NONCE_KEY] = nonce
+        query["nonce"] = nonce
+
+    if conf.get(CONF_USE_PKCE, False):
+        code_verifier, code_challenge = _generate_pkce_pair()
+        stored_params[_PKCE_VERIFIER_KEY] = code_verifier
+        query["code_challenge"] = code_challenge
+        query["code_challenge_method"] = "S256"
+
+    android_transaction_id: str | None = None
+    poll_secret: str | None = None
+    if _is_android_client(client_id):
+        android_transaction_id = secrets.token_urlsafe(32)
+        poll_secret = secrets.token_urlsafe(32)
+        stored_params[_ANDROID_TRANSACTION_KEY] = android_transaction_id
+        try:
+            store_pending(
+                hass,
+                ANDROID_STATE_STORE,
+                android_transaction_id,
+                {
+                    "status": "pending",
+                    "secret_hash": sha256(poll_secret.encode()).hexdigest(),
+                },
+                ttl=ANDROID_STATE_TTL,
+            )
+        except StateStoreFull:
+            return html_response(
+                "Too many OpenID sign-ins are pending; try again shortly",
+                status=HTTPStatus.TOO_MANY_REQUESTS,
+            )
+
+    try:
+        store_pending(hass, AUTH_STATE_STORE, internal_state, stored_params)
+    except StateStoreFull:
+        if android_transaction_id:
+            pop_pending(
+                hass,
+                ANDROID_STATE_STORE,
+                android_transaction_id,
+                ttl=ANDROID_STATE_TTL,
+            )
+        return html_response(
+            "Too many OpenID sign-ins are pending; try again shortly",
+            status=HTTPStatus.TOO_MANY_REQUESTS,
+        )
+
+    provider_url = str(URL(conf[CONF_AUTHORIZE_URL]).update_query(query))
+    if android_transaction_id and poll_secret:
+        return _android_waiting_response(
+            hass,
+            request,
+            provider_url,
+            android_transaction_id,
+            poll_secret,
+        )
+    return redirect_response(provider_url)
 
 
 class OpenIDAuthorizeView(HomeAssistantView):
@@ -211,7 +339,6 @@ class OpenIDAuthorizeView(HomeAssistantView):
             )
 
         params = dict(request.rel_url.query)
-        params["base_url"] = str(request.url.origin())
         if not await _validate_client_request(self.hass, params):
             _LOGGER.warning("Rejected invalid OAuth client or redirect URI")
             return Response(
@@ -225,70 +352,9 @@ class OpenIDAuthorizeView(HomeAssistantView):
             )
             return await self._show_consent_screen(request, params)
 
-        client_id = params.get("client_id")
-        client_state = params.get("client_state") or params.get("state")
-        if not client_state and _is_android_client(client_id):
-            client_state = f"android-{secrets.token_urlsafe(24)}"
-            params = dict(params)
-            params["client_state"] = client_state
-            _LOGGER.debug("Generated Android client correlation state")
-
-        if client_state:
-            state = secrets.token_urlsafe(24)
-            params = dict(params)
-            params["client_state"] = client_state
-            _LOGGER.debug(
-                "Created internal authorization state %s", _short_id(state)
-            )
-        else:
-            state = secrets.token_urlsafe(24)
-            _LOGGER.debug("Created internal authorization state %s", _short_id(state))
-
-        base_url = params.get("base_url", "")
-        redirect_uri = str(URL(base_url).with_path("/auth/openid/callback"))
-
-        if _is_android_client(client_id) and client_state:
-            store_pending(
-                self.hass,
-                ANDROID_STATE_STORE,
-                client_state,
-                {"status": "pending"},
-                ttl=ANDROID_STATE_TTL,
-            )
-
-        stored_params = dict(params)
-        query: dict[str, str] = {
-            "response_type": "code",
-            "client_id": conf[CONF_CLIENT_ID],
-            "redirect_uri": redirect_uri,
-            "scope": conf.get(CONF_SCOPE, ""),
-            "state": state,
-        }
-
-        if "openid" in conf.get(CONF_SCOPE, "").split():
-            nonce = secrets.token_urlsafe(24)
-            stored_params[_OIDC_NONCE_KEY] = nonce
-            query["nonce"] = nonce
-
-        if conf.get(CONF_USE_PKCE, False):
-            code_verifier, code_challenge = _generate_pkce_pair()
-            stored_params[_PKCE_VERIFIER_KEY] = code_verifier
-            query["code_challenge"] = code_challenge
-            query["code_challenge_method"] = "S256"
-            _LOGGER.debug("PKCE enabled; code_challenge added to authorize request")
-
-        store_pending(self.hass, AUTH_STATE_STORE, state, stored_params)
-        _LOGGER.debug("Stored authorization state %s", _short_id(state))
-
-        encoded_query = urlencode(query)
-        url = conf[CONF_AUTHORIZE_URL] + "?" + encoded_query
-
-        if _is_android_client(client_id) and client_state:
-            _LOGGER.debug("Serving Android authorization wait page")
-            return _android_waiting_response(self.hass, url, client_state)
-
-        _LOGGER.debug("Redirecting to the configured identity provider")
-        return Response(status=HTTPStatus.FOUND, headers={"Location": url})
+        return await _begin_provider_authorization(
+            self.hass, request, params, conf
+        )
 
 
     async def _show_consent_screen(
@@ -363,71 +429,9 @@ class OpenIDConsentView(HomeAssistantView):
             )
 
         _LOGGER.info("User authorized the validated OAuth client")
-        client_id = original_params.get("client_id")
-        client_state = original_params.get("client_state") or original_params.get(
-            "state"
+        return await _begin_provider_authorization(
+            self.hass, request, original_params, conf
         )
-        if not client_state and _is_android_client(client_id):
-            client_state = f"android-{secrets.token_urlsafe(24)}"
-            original_params["client_state"] = client_state
-            _LOGGER.debug("Generated Android client correlation state after consent")
-
-        if client_state:
-            state = secrets.token_urlsafe(24)
-            original_params["client_state"] = client_state
-            _LOGGER.debug(
-                "Created internal authorization state %s", _short_id(state)
-            )
-        else:
-            state = secrets.token_urlsafe(24)
-            _LOGGER.debug("Created internal authorization state %s", _short_id(state))
-
-        base_url = original_params.get("base_url", "")
-        redirect_uri = str(URL(base_url).with_path("/auth/openid/callback"))
-
-        if _is_android_client(client_id) and client_state:
-            store_pending(
-                self.hass,
-                ANDROID_STATE_STORE,
-                client_state,
-                {"status": "pending"},
-                ttl=ANDROID_STATE_TTL,
-            )
-
-        query: dict[str, str] = {
-            "response_type": "code",
-            "client_id": conf[CONF_CLIENT_ID],
-            "redirect_uri": redirect_uri,
-            "scope": conf.get(CONF_SCOPE, ""),
-            "state": state,
-        }
-
-        if "openid" in conf.get(CONF_SCOPE, "").split():
-            nonce = secrets.token_urlsafe(24)
-            original_params[_OIDC_NONCE_KEY] = nonce
-            query["nonce"] = nonce
-
-        if conf.get(CONF_USE_PKCE, False):
-            code_verifier, code_challenge = _generate_pkce_pair()
-            original_params[_PKCE_VERIFIER_KEY] = code_verifier
-            query["code_challenge"] = code_challenge
-            query["code_challenge_method"] = "S256"
-            _LOGGER.debug(
-                "PKCE enabled; code_challenge added to consent authorize request"
-            )
-
-        store_pending(self.hass, AUTH_STATE_STORE, state, original_params)
-        _LOGGER.debug("Stored consent authorization state %s", _short_id(state))
-
-        encoded_query = urlencode(query)
-        url = conf[CONF_AUTHORIZE_URL] + "?" + encoded_query
-
-        if _is_android_client(client_id) and client_state:
-            _LOGGER.debug("Serving Android consent wait page")
-            return _android_waiting_response(self.hass, url, client_state)
-
-        _LOGGER.debug("Redirecting to the configured identity provider after consent")
-        return Response(status=HTTPStatus.FOUND, headers={"Location": url})
 
 
 class OpenIDCallbackView(HomeAssistantView):
@@ -723,15 +727,25 @@ class OpenIDCallbackView(HomeAssistantView):
         _LOGGER.debug("Created Home Assistant authorization code")
         callback_url = self._build_callback_url(url, result, oauth_client_state)
 
-        if _is_android_client(params.get("client_id")) and oauth_client_state:
-            store_pending(
+        if transaction_id := params.get(_ANDROID_TRANSACTION_KEY):
+            android_entry = get_pending(
                 self.hass,
                 ANDROID_STATE_STORE,
-                oauth_client_state,
-                {"status": "completed", "callback_url": callback_url},
+                transaction_id,
                 ttl=ANDROID_STATE_TTL,
             )
-            return self._android_completed_response(callback_url)
+            if android_entry:
+                android_entry.update(
+                    {"status": "completed", "callback_url": callback_url}
+                )
+                store_pending(
+                    self.hass,
+                    ANDROID_STATE_STORE,
+                    transaction_id,
+                    android_entry,
+                    ttl=ANDROID_STATE_TTL,
+                )
+            return self._android_completed_response()
 
         return Response(status=HTTPStatus.FOUND, headers={"Location": callback_url})
 
@@ -772,19 +786,10 @@ class OpenIDCallbackView(HomeAssistantView):
         callback_url = str(parsed_url.with_query(all_params))
         return callback_url
 
-    def _android_completed_response(self, callback_url: str) -> Response:
+    def _android_completed_response(self) -> Response:
         """Return completion page for Android polling flow."""
         template_content = self.hass.data[DOMAIN]["android_completed_template"]
-        template = Template(template_content)
-
-        safe_callback_url = callback_url.replace("'", "%27").replace('"', "%22")
-        html = template.substitute(callback_url=safe_callback_url)
-
-        return Response(
-            status=HTTPStatus.OK,
-            content_type="text/html",
-            text=html,
-        )
+        return html_response(template_content)
 
     @staticmethod
     def _store_logout_metadata(
@@ -963,23 +968,34 @@ class OpenIDAndroidStatusView(HomeAssistantView):
 
     async def get(self, request: Request) -> Response:
         """Return completion status for a given OAuth state."""
-        state = request.rel_url.query.get("state")
-        if not state:
-            payload = {"status": "error", "message": "Missing state"}
-            return Response(
-                status=HTTPStatus.BAD_REQUEST,
-                text=json.dumps(payload),
-                content_type="application/json",
+        transaction_id = request.rel_url.query.get("transaction")
+        poll_secret = request.cookies.get(_ANDROID_POLL_COOKIE)
+        if not transaction_id or not poll_secret:
+            return json_response(
+                {"status": "error", "message": "Missing transaction proof"},
+                status=HTTPStatus.FORBIDDEN,
             )
 
         entry = get_pending(
-            self.hass, ANDROID_STATE_STORE, state, ttl=ANDROID_STATE_TTL
+            self.hass,
+            ANDROID_STATE_STORE,
+            transaction_id,
+            ttl=ANDROID_STATE_TTL,
         )
         if not entry:
-            return Response(
-                status=HTTPStatus.OK,
-                text=json.dumps({"status": "pending"}),
-                content_type="application/json",
+            return json_response(
+                {"status": "expired"},
+                status=HTTPStatus.GONE,
+            )
+
+        expected_hash = entry.get("secret_hash")
+        supplied_hash = sha256(poll_secret.encode()).hexdigest()
+        if not isinstance(expected_hash, str) or not secrets.compare_digest(
+            expected_hash, supplied_hash
+        ):
+            return json_response(
+                {"status": "error", "message": "Invalid transaction proof"},
+                status=HTTPStatus.FORBIDDEN,
             )
 
         if entry.get("status") == "completed" and entry.get("callback_url"):
@@ -988,19 +1004,19 @@ class OpenIDAndroidStatusView(HomeAssistantView):
                 "callback_url": entry["callback_url"],
             }
             pop_pending(
-                self.hass, ANDROID_STATE_STORE, state, ttl=ANDROID_STATE_TTL
+                self.hass,
+                ANDROID_STATE_STORE,
+                transaction_id,
+                ttl=ANDROID_STATE_TTL,
             )
-            return Response(
-                status=HTTPStatus.OK,
-                text=json.dumps(payload),
-                content_type="application/json",
+            response = json_response(payload)
+            response.del_cookie(
+                _ANDROID_POLL_COOKIE,
+                path="/auth/openid/android/status",
             )
+            return response
 
-        return Response(
-            status=HTTPStatus.OK,
-            text=json.dumps({"status": "pending"}),
-            content_type="application/json",
-        )
+        return json_response({"status": "pending"})
 
 def _show_error(
     hass,
