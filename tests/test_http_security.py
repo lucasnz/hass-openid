@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 
 from aiohttp.test_utils import make_mocked_request
+import pytest
 
 from custom_components.openid.const import DOMAIN
 from custom_components.openid.views import _android_waiting_response
@@ -34,3 +35,34 @@ def test_android_poll_secret_is_cookie_bound_and_not_rendered() -> None:
     cookie = response.headers.getall("Set-Cookie")[0]
     assert "HttpOnly" in cookie
     assert "SameSite=Lax" in cookie
+
+
+@pytest.mark.asyncio
+async def test_android_transaction_cannot_be_polled_without_browser_cookie() -> None:
+    """Knowing a transaction ID alone never returns an HA authorization code."""
+    from custom_components.openid.state_store import (
+        ANDROID_STATE_STORE,
+        ANDROID_STATE_TTL,
+        store_pending,
+    )
+    from custom_components.openid.views import OpenIDAndroidStatusView
+
+    hass = SimpleNamespace(data={})
+    store_pending(
+        hass,
+        ANDROID_STATE_STORE,
+        "known-transaction",
+        {
+            "status": "completed",
+            "secret_hash": "not-the-supplied-secret",
+            "callback_url": "https://ha.example/?code=secret-code",
+        },
+        ttl=ANDROID_STATE_TTL,
+    )
+    request = make_mocked_request(
+        "GET",
+        "/auth/openid/android/status?transaction=known-transaction",
+    )
+    response = await OpenIDAndroidStatusView(hass).get(request)
+    assert response.status == 403
+    assert "secret-code" not in response.text

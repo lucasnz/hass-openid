@@ -1,0 +1,14 @@
+{
+  "name": "hass-openid-frontend-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "lint": "eslint custom_components/openid/*.js tests_js/*.js",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "eslint": "10.8.0",
+    "jsdom": "30.0.1",
+    "vitest": "4.1.10"
+  }
+}

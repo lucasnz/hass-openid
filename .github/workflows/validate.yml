@@ -4,8 +4,11 @@ on:
   push:
   pull_request:
   schedule:
-    - cron: '0 0 * * *'
+    - cron: "0 0 * * *"
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   validate-hacs:
@@ -21,17 +24,67 @@ jobs:
 
   tests:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dependency-set: [pinned, current]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.14'
+          python-version: "3.14"
           cache: pip
           cache-dependency-path: requirements_test.txt
-      - name: Install test requirements
+      - name: Install pinned test requirements
         run: python -m pip install --upgrade pip -r requirements_test.txt
+      - name: Test against current Home Assistant helper
+        if: matrix.dependency-set == 'current'
+        run: >-
+          python -m pip install --upgrade
+          pytest-homeassistant-custom-component
+          home-assistant-frontend
       - name: Run tests
         run: >-
           pytest -q
           --cov=custom_components.openid
           --cov-report=term-missing
+          --cov-fail-under=25
+
+  python-static-analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: |
+            requirements_test.txt
+            requirements_lint.txt
+      - run: python -m pip install --upgrade pip -r requirements_test.txt -r requirements_lint.txt
+      - name: Ruff
+        run: ruff check custom_components tests
+      - name: Bandit
+        run: bandit -q -r custom_components/openid -ll
+      - name: Mypy security helpers
+        run: >-
+          mypy
+          custom_components/openid/identity.py
+          custom_components/openid/state_store.py
+          custom_components/openid/network.py
+      - name: Dependency audit
+        run: pip-audit -r requirements_test.txt
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+      - name: Install frontend test dependencies
+        run: npm install --ignore-scripts
+      - name: Lint frontend code
+        run: npm run lint
+      - name: Test frontend code
+        run: npm test

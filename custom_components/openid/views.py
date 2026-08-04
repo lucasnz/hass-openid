@@ -8,14 +8,12 @@ from contextlib import suppress
 from hashlib import sha256
 from html import escape
 from http import HTTPStatus
-import json
 import logging
 import secrets
 from string import Template
 from typing import Any
-from urllib.parse import quote, urlencode, urlsplit
+from urllib.parse import urlsplit
 
-from aiohttp import ClientSession
 from aiohttp.web import Request, Response
 from yarl import URL
 
@@ -24,7 +22,7 @@ from homeassistant.auth.models import User
 from homeassistant.components.auth import create_auth_code, indieauth
 from homeassistant.components.http import KEY_HASS_USER, HomeAssistantView
 from homeassistant.components.person import DOMAIN as PERSON_DOMAIN, async_create_person
-from homeassistant.const import CONF_CLIENT_ID, CONF_CLIENT_SECRET
+from homeassistant.const import CONF_CLIENT_ID
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.network import NoURLAvailableError, get_url
 from homeassistant.util import slugify
@@ -44,7 +42,6 @@ from .auth_service import (
     async_exchange_and_validate_identity,
 )
 from .config_helpers import get_active_config
-from .identity import normalize_username
 from .const import (
     CONF_AUTHORIZE_URL,
     CONF_BLOCK_LOGIN,
@@ -56,11 +53,7 @@ from .const import (
     CONF_LOGOUT_URL,
     CONF_POST_LOGOUT_URL,
     CONF_SCOPE,
-    CONF_TOKEN_URL,
-    CONF_USE_HEADER_AUTH,
     CONF_USE_PKCE,
-    CONF_USER_INFO_URL,
-    CONF_USERNAME_FIELD,
     CONF_VALIDATE_TLS,
     CRED_ID_TOKEN,
     CRED_ISSUER,
@@ -70,7 +63,13 @@ from .const import (
     CRED_SUBJECT,
     DOMAIN,
 )
-from .http_security import html_response, json_response, redirect_response
+from .http_security import (
+    empty_response,
+    html_response,
+    json_response,
+    redirect_response,
+    text_response,
+)
 from .oidc_helper import async_validate_logout_token
 from .state_store import (
     ANDROID_STATE_STORE,
@@ -392,12 +391,12 @@ class OpenIDAuthorizeView(HomeAssistantView):
 
         params = dict(request.rel_url.query)
         if not _request_parameters_are_bounded(params):
-            return Response(status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+            return empty_response(status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
         if not await _validate_client_request(self.hass, params):
             _LOGGER.warning("Rejected invalid OAuth client or redirect URI")
-            return Response(
+            return text_response(
+                "Invalid OAuth client or redirect URI",
                 status=HTTPStatus.FORBIDDEN,
-                text="Invalid OAuth client or redirect URI",
             )
 
         if self.should_show_consent_screen(params):
@@ -453,9 +452,9 @@ class OpenIDConsentView(HomeAssistantView):
         """Handle consent form submission."""
         conf = get_active_config(self.hass)
         if conf is None:
-            return Response(
+            return text_response(
+                "OpenID integration is not configured",
                 status=HTTPStatus.SERVICE_UNAVAILABLE,
-                text="OpenID integration is not configured",
             )
 
         form_data = await request.post()
@@ -463,7 +462,7 @@ class OpenIDConsentView(HomeAssistantView):
         consent_state = form_data.get("state")
         if not consent_state:
             _LOGGER.error("Consent form submitted without state")
-            return Response(status=HTTPStatus.BAD_REQUEST, text="Invalid request")
+            return text_response("Invalid request", status=HTTPStatus.BAD_REQUEST)
 
         original_params = pop_pending(
             self.hass, CONSENT_STATE_STORE, str(consent_state)
@@ -471,15 +470,16 @@ class OpenIDConsentView(HomeAssistantView):
 
         if not original_params:
             _LOGGER.error("Invalid or expired consent state %s", _short_id(str(consent_state)))
-            return Response(
-                status=HTTPStatus.BAD_REQUEST, text="Invalid or expired consent"
+            return text_response(
+                "Invalid or expired consent",
+                status=HTTPStatus.BAD_REQUEST,
             )
 
         if not await _validate_client_request(self.hass, original_params):
             _LOGGER.warning("Rejected invalid OAuth client after consent")
-            return Response(
+            return text_response(
+                "Invalid OAuth client or redirect URI",
                 status=HTTPStatus.FORBIDDEN,
-                text="Invalid OAuth client or redirect URI",
             )
 
         _LOGGER.info("User authorized the validated OAuth client")
@@ -528,9 +528,9 @@ class OpenIDCallbackView(HomeAssistantView):
         params = {**params, **pending}
         if not await _validate_client_request(self.hass, params):
             _LOGGER.warning("Rejected invalid OAuth client during callback")
-            return Response(
+            return text_response(
+                "Invalid OAuth client or redirect URI",
                 status=HTTPStatus.FORBIDDEN,
-                text="Invalid OAuth client or redirect URI",
             )
         params["_validated_redirect_uri"] = params["redirect_uri"]
 
@@ -724,7 +724,7 @@ class OpenIDCallbackView(HomeAssistantView):
                 )
             return self._android_completed_response()
 
-        return Response(status=HTTPStatus.FOUND, headers={"Location": callback_url})
+        return redirect_response(callback_url)
 
     @staticmethod
     def _build_callback_url(
@@ -848,7 +848,7 @@ class OpenIDSessionView(HomeAssistantView):
         """Return only an opaque same-origin logout path to the frontend."""
         conf = get_active_config(self.hass)
         if not conf or not conf.get(CONF_LOGOUT_URL):
-            return Response(status=HTTPStatus.NO_CONTENT)
+            return empty_response(status=HTTPStatus.NO_CONTENT)
 
         user: User = request[KEY_HASS_USER]
         credentials = [
@@ -857,7 +857,7 @@ class OpenIDSessionView(HomeAssistantView):
             if candidate.auth_provider_type == DOMAIN
         ]
         if not credentials:
-            return Response(status=HTTPStatus.NO_CONTENT)
+            return empty_response(status=HTTPStatus.NO_CONTENT)
 
         # Prefer the credential with current logout metadata. Ambiguity is
         # rejected rather than exposing a token belonging to an arbitrary IdP
@@ -869,7 +869,7 @@ class OpenIDSessionView(HomeAssistantView):
             or candidate.data.get(CRED_SESSION_STATE)
         ]
         if len(candidates) != 1:
-            return Response(status=HTTPStatus.NO_CONTENT)
+            return empty_response(status=HTTPStatus.NO_CONTENT)
         credential = candidates[0]
 
         params: dict[str, str] = {}
@@ -950,18 +950,18 @@ class OpenIDBackchannelLogoutView(HomeAssistantView):
     async def post(self, request: Request) -> Response:
         """Validate a logout token and revoke matching HA refresh tokens."""
         if request.content_length is not None and request.content_length > 65536:
-            return Response(status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+            return empty_response(status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
         conf = get_active_config(self.hass)
         if not conf or not all(
             conf.get(key)
             for key in (CONF_ISSUER, CONF_JWKS_URL, CONF_CLIENT_ID)
         ):
-            return Response(status=HTTPStatus.NOT_FOUND)
+            return empty_response(status=HTTPStatus.NOT_FOUND)
 
         form = await request.post()
         logout_token = form.get("logout_token")
         if not isinstance(logout_token, str) or not logout_token:
-            return Response(status=HTTPStatus.BAD_REQUEST)
+            return empty_response(status=HTTPStatus.BAD_REQUEST)
 
         algorithms = conf.get(CONF_ID_TOKEN_SIGNING_ALGORITHMS, ["RS256"])
         if isinstance(algorithms, str):
@@ -983,7 +983,7 @@ class OpenIDBackchannelLogoutView(HomeAssistantView):
                 jti,
                 ttl=LOGOUT_TOKEN_JTI_TTL,
             ):
-                return Response(status=HTTPStatus.BAD_REQUEST)
+                return empty_response(status=HTTPStatus.BAD_REQUEST)
             store_pending(
                 self.hass,
                 LOGOUT_TOKEN_JTI_STORE,
@@ -993,10 +993,10 @@ class OpenIDBackchannelLogoutView(HomeAssistantView):
             )
         except (ValueError, LookupError, StateStoreFull):
             _LOGGER.warning("Rejected invalid or replayed OIDC logout token")
-            return Response(status=HTTPStatus.BAD_REQUEST)
+            return empty_response(status=HTTPStatus.BAD_REQUEST)
         except Exception:
             _LOGGER.exception("Failed to validate OIDC logout token")
-            return Response(status=HTTPStatus.SERVICE_UNAVAILABLE)
+            return empty_response(status=HTTPStatus.SERVICE_UNAVAILABLE)
 
         subject = claims.get("sub")
         session_id = claims.get("sid")
@@ -1031,7 +1031,7 @@ class OpenIDBackchannelLogoutView(HomeAssistantView):
                     revoked += 1
 
         _LOGGER.info("Processed OIDC back-channel logout; revoked %d session(s)", revoked)
-        return Response(status=HTTPStatus.NO_CONTENT)
+        return empty_response(status=HTTPStatus.NO_CONTENT)
 
 
 class OpenIDAndroidStatusView(HomeAssistantView):

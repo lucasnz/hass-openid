@@ -67,3 +67,23 @@ def redirect_response(location: str) -> Response:
         status=HTTPStatus.FOUND,
         headers={"Location": location, **NO_STORE_HEADERS},
     )
+
+
+def text_response(
+    text: str,
+    *,
+    status: HTTPStatus = HTTPStatus.OK,
+) -> Response:
+    """Return a no-store plain-text authentication response."""
+    return Response(
+        status=status,
+        text=text,
+        content_type="text/plain",
+        charset="utf-8",
+        headers=NO_STORE_HEADERS,
+    )
+
+
+def empty_response(*, status: HTTPStatus) -> Response:
+    """Return an empty no-store authentication response."""
+    return Response(status=status, headers=NO_STORE_HEADERS)
