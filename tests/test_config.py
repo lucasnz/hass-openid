@@ -10,6 +10,7 @@ from homeassistant.core import HomeAssistant
 from custom_components.openid import _async_prepare_config
 from custom_components.openid.config_flow import (
     CONF_ID_TOKEN_SIGNING_ALGORITHMS_INPUT,
+    CONF_TRUSTED_IPS_INPUT,
     OpenIDConfigFlow,
 )
 from custom_components.openid.const import (
@@ -29,7 +30,6 @@ from custom_components.openid.const import (
     CONF_SCOPE,
     CONF_TOKEN_URL,
     CONF_USER_INFO_URL,
-    CONF_TRUSTED_IPS_INPUT,
     CONF_USE_HEADER_AUTH,
     CONF_USE_PKCE,
     CONF_VALIDATE_TLS,

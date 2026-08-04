@@ -32,7 +32,7 @@ const providerLogoutEnabled = async (hass) => {
     if (!response?.ok || response.status === 204) return false;
     const payload = await response.json();
     return payload?.enabled === true;
-  } catch (_err) {
+  } catch {
     return false;
   }
 };

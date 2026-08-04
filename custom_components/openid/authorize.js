@@ -26,7 +26,7 @@
     let responseBody;
     try {
       responseBody = await response.clone().json();
-    } catch (_err) {
+    } catch {
       return response;
     }
 

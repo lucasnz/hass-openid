@@ -45,7 +45,7 @@
           return;
         }
       }
-    } catch (_err) {
+    } catch {
       // Ignore a transient same-origin polling failure.
     }
 
