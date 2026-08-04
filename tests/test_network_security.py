@@ -41,7 +41,7 @@ async def test_basic_auth_form_encodes_client_credentials(
     request_json = AsyncMock(return_value={"access_token": "token"})
     monkeypatch.setattr(oauth_helper, "async_request_json_object", request_json)
     await oauth_helper.exchange_code_for_token(
-        SimpleNamespace(),
+        SimpleNamespace(data={}),
         token_url="https://idp.example/token",
         code="code",
         client_id="client:id",

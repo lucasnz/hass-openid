@@ -495,7 +495,8 @@ async def _async_setup_shared(hass: HomeAssistant) -> None:
         provider = domain_data.get(DATA_AUTH_PROVIDER)
         providers = getattr(hass.auth, "_providers", None)  # noqa: SLF001
         if (
-            not isinstance(providers, dict)
+            provider is None
+            or not isinstance(providers, dict)
             or providers.get((DOMAIN, None)) is not provider
         ):
             domain_data[DATA_AUTH_PROVIDER] = await async_register_auth_provider(hass)

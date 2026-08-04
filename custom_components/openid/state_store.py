@@ -40,7 +40,7 @@ def store_pending(
     value: dict[str, Any],
     *,
     ttl: float = AUTH_STATE_TTL,
-    max_entries: int = MAX_PENDING_ENTRIES,
+    max_entries: int | None = None,
 ) -> None:
     """Store a bounded pending entry without evicting an active flow."""
     if not key or len(key) > MAX_STATE_KEY_LENGTH:
@@ -49,7 +49,12 @@ def store_pending(
     store: dict[str, dict[str, Any]] = hass.data.setdefault(store_name, {})
     _cleanup(store, ttl)
 
-    if key not in store and len(store) >= max_entries:
+    effective_max_entries = (
+        MAX_PENDING_ENTRIES if max_entries is None else max_entries
+    )
+    if effective_max_entries < 1:
+        raise ValueError("max_entries must be at least 1")
+    if key not in store and len(store) >= effective_max_entries:
         raise StateStoreFull("too many authentication requests are pending")
 
     store[key] = {"created_at": monotonic(), "value": dict(value)}

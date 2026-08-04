@@ -11,6 +11,7 @@ from homeassistant.const import CONF_CLIENT_ID, CONF_CLIENT_SECRET
 from homeassistant.core import HomeAssistant
 
 from custom_components.openid import views
+from custom_components.openid.account_linker import AmbiguousAccountError
 from custom_components.openid.auth_service import ValidatedProviderIdentity
 from custom_components.openid.const import (
     CONF_BLOCK_LOGIN,
@@ -194,7 +195,9 @@ async def test_existing_user_lookup_rejects_ambiguous_matches() -> None:
         auth=SimpleNamespace(async_get_users=AsyncMock(return_value=users))
     )
 
-    with pytest.raises(ValueError, match="multiple non-OpenID credentials"):
+    with pytest.raises(
+        AmbiguousAccountError, match="multiple non-OpenID credentials"
+    ):
         await OpenIDCallbackView(hass)._async_find_user_by_username(
             "mapped@example.com"
         )

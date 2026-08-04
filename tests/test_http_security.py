@@ -6,7 +6,10 @@ from aiohttp.test_utils import make_mocked_request
 import pytest
 
 from custom_components.openid.const import DOMAIN
-from custom_components.openid.views import _android_waiting_response
+from custom_components.openid.views import (
+    _android_poll_cookie_name,
+    _android_waiting_response,
+)
 
 
 def test_android_poll_secret_is_cookie_bound_and_not_rendered() -> None:
@@ -32,9 +35,10 @@ def test_android_poll_secret_is_cookie_bound_and_not_rendered() -> None:
     )
     assert secret not in response.text
     assert "</script><script>" not in response.text
-    cookie = response.headers.getall("Set-Cookie")[0]
-    assert "HttpOnly" in cookie
-    assert "SameSite=Lax" in cookie
+    cookie = response.cookies[_android_poll_cookie_name("transaction")]
+    assert cookie.value == secret
+    assert cookie["httponly"] is True
+    assert cookie["samesite"] == "Lax"
 
 
 @pytest.mark.asyncio
