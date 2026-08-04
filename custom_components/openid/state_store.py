@@ -10,9 +10,11 @@ from homeassistant.core import HomeAssistant
 AUTH_STATE_STORE = "_openid_state"
 CONSENT_STATE_STORE = "_openid_consent_pending"
 ANDROID_STATE_STORE = "_openid_android_callbacks"
+LOGOUT_STATE_STORE = "_openid_logout_tickets"
 
 AUTH_STATE_TTL = 10 * 60
 ANDROID_STATE_TTL = 15 * 60
+LOGOUT_STATE_TTL = 60
 MAX_PENDING_ENTRIES = 256
 MAX_STATE_KEY_LENGTH = 512
 

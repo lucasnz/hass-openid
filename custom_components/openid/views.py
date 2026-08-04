@@ -65,6 +65,8 @@ from .oidc_helper import async_validate_id_token
 from .state_store import (
     ANDROID_STATE_STORE,
     ANDROID_STATE_TTL,
+    LOGOUT_STATE_STORE,
+    LOGOUT_STATE_TTL,
     AUTH_STATE_STORE,
     CONSENT_STATE_STORE,
     StateStoreFull,
@@ -949,7 +951,7 @@ class OpenIDCallbackView(HomeAssistantView):
         return None
 
 class OpenIDSessionView(HomeAssistantView):
-    """Expose logout metadata for the active user session."""
+    """Create a short-lived server-side IdP logout ticket."""
 
     name = "api:openid:session"
     url = "/auth/openid/session"
@@ -960,49 +962,95 @@ class OpenIDSessionView(HomeAssistantView):
         self.hass = hass
 
     async def get(self, request: Request) -> Response:
-        """Return logout configuration for the current user."""
+        """Return only an opaque same-origin logout path to the frontend."""
         conf = get_active_config(self.hass)
         if not conf or not conf.get(CONF_LOGOUT_URL):
             return Response(status=HTTPStatus.NO_CONTENT)
 
         user: User = request[KEY_HASS_USER]
-        credential = next(
-            (
-                candidate
-                for candidate in user.credentials
-                if candidate.auth_provider_type == DOMAIN
-            ),
-            None,
-        )
-
-        if credential is None:
+        credentials = [
+            candidate
+            for candidate in user.credentials
+            if candidate.auth_provider_type == DOMAIN
+        ]
+        if not credentials:
             return Response(status=HTTPStatus.NO_CONTENT)
 
-        params: dict[str, str] = {}
+        # Prefer the credential with current logout metadata. Ambiguity is
+        # rejected rather than exposing a token belonging to an arbitrary IdP
+        # session.
+        candidates = [
+            candidate
+            for candidate in credentials
+            if candidate.data.get(CRED_ID_TOKEN)
+            or candidate.data.get(CRED_SESSION_STATE)
+        ]
+        if len(candidates) != 1:
+            return Response(status=HTTPStatus.NO_CONTENT)
+        credential = candidates[0]
 
+        params: dict[str, str] = {}
         if id_token := credential.data.get(CRED_ID_TOKEN):
             params["id_token_hint"] = id_token
-
         if session_state := credential.data.get(CRED_SESSION_STATE):
             params["session_state"] = session_state
-
         if redirect_uri := credential.data.get(CRED_LOGOUT_REDIRECT_URI):
             params["post_logout_redirect_uri"] = redirect_uri
-
         if "id_token_hint" not in params and "session_state" not in params:
             if client_id := conf.get(CONF_CLIENT_ID):
-                params.setdefault("client_id", client_id)
+                params["client_id"] = client_id
 
-        payload = {
-            "logout_url": conf[CONF_LOGOUT_URL],
-            "parameters": params,
-        }
+        target = str(URL(conf[CONF_LOGOUT_URL]).update_query(params))
+        ticket = secrets.token_urlsafe(32)
+        try:
+            store_pending(
+                self.hass,
+                LOGOUT_STATE_STORE,
+                ticket,
+                {"target": target, "user_id": user.id},
+                ttl=LOGOUT_STATE_TTL,
+            )
+        except StateStoreFull:
+            return json_response(
+                {"error": "too_many_pending_logouts"},
+                status=HTTPStatus.TOO_MANY_REQUESTS,
+            )
 
-        return Response(
-            status=HTTPStatus.OK,
-            text=json.dumps(payload),
-            content_type="application/json",
+        return json_response({"logout_path": f"/auth/openid/logout?ticket={ticket}"})
+
+
+class OpenIDLogoutView(HomeAssistantView):
+    """Consume a one-use logout ticket and redirect to the IdP."""
+
+    name = "api:openid:logout"
+    url = "/auth/openid/logout"
+    requires_auth = False
+
+    def __init__(self, hass: HomeAssistant) -> None:
+        """Initialize the logout view."""
+        self.hass = hass
+
+    async def get(self, request: Request) -> Response:
+        """Consume an opaque logout ticket without exposing ID tokens to JS."""
+        ticket = request.rel_url.query.get("ticket")
+        if not ticket:
+            return html_response(
+                "Invalid or expired logout request",
+                status=HTTPStatus.BAD_REQUEST,
+            )
+        pending = pop_pending(
+            self.hass,
+            LOGOUT_STATE_STORE,
+            ticket,
+            ttl=LOGOUT_STATE_TTL,
         )
+        target = pending.get("target") if pending else None
+        if not isinstance(target, str):
+            return html_response(
+                "Invalid or expired logout request",
+                status=HTTPStatus.BAD_REQUEST,
+            )
+        return redirect_response(target)
 
 
 class OpenIDAndroidStatusView(HomeAssistantView):
