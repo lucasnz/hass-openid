@@ -11,6 +11,7 @@ from homeassistant.const import CONF_CLIENT_ID, CONF_CLIENT_SECRET
 from homeassistant.core import HomeAssistant
 
 from custom_components.openid import views
+from custom_components.openid.auth_service import ValidatedProviderIdentity
 from custom_components.openid.const import (
     CONF_BLOCK_LOGIN,
     CONF_CREATE_USER,
@@ -263,18 +264,17 @@ async def test_callback_links_existing_user_by_mapped_username(
     )
     monkeypatch.setattr(
         views,
-        "exchange_code_for_token",
-        AsyncMock(return_value={"access_token": "access-token"}),
-    )
-    monkeypatch.setattr(
-        views,
-        "fetch_user_info",
+        "async_exchange_and_validate_identity",
         AsyncMock(
-            return_value={
-                "email": "  MAPPED@Example.COM  ",
-                "name": "Display Name",
-                "sub": "subject-1",
-            }
+            return_value=ValidatedProviderIdentity(
+                username="mapped@example.com",
+                token_data={"access_token": "access-token"},
+                user_info={"email": "mapped@example.com"},
+                credential_fields={
+                    "username": "mapped@example.com",
+                    "name": "Display Name",
+                },
+            )
         ),
     )
     monkeypatch.setattr(

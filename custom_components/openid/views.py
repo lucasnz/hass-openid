@@ -29,6 +29,12 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.network import NoURLAvailableError, get_url
 from homeassistant.util import slugify
 
+from .account_linker import (
+    AccountLinkError,
+    AmbiguousAccountError,
+    async_find_user_by_username,
+    async_resolve_user,
+)
 from .auth_provider import (
     OpenIDAmbiguousIdentityError,
     OpenIDIdentityConflictError,
@@ -621,70 +627,43 @@ class OpenIDCallbackView(HomeAssistantView):
             postlogout_url,
         )
 
-        user: User | None = await self.hass.auth.async_get_user_by_credentials(
-            credentials
-        )
-
-        if user is None and (username_value := credential_data.get("username")):
-            try:
-                existing_user = await self._async_find_user_by_username(username_value)
-            except ValueError as err:
-                _LOGGER.warning(
-                    "Refusing ambiguous username match for %s: %s",
-                    username_value,
-                    err,
-                )
-                return _show_error(
-                    self.hass,
-                    params,
-                    alert_type="error",
-                    alert_message=(
-                        "OpenID login failed! More than one Home Assistant account "
-                        "has credentials matching this username."
-                    ),
-                )
-
-            if existing_user is not None:
-                try:
-                    if credentials.is_new:
-                        await self.hass.auth.async_link_user(existing_user, credentials)
-                        credentials.is_new = False
-                except ValueError as err:
-                    _LOGGER.error(
-                        "Failed to link credentials to existing user %s: %s",
-                        username_value,
-                        err,
-                    )
-                    return _show_error(
-                        self.hass,
-                        params,
-                        alert_type="error",
-                        alert_message=(
-                            "OpenID login failed! The matching Home Assistant account could not be linked."
-                        ),
-                    )
-                else:
-                    credential_data.setdefault("openid_groups_initialized", True)
-                    user = existing_user
-
-        if user is None and conf.get(CONF_CREATE_USER, False):
-            try:
-                user = await self.hass.auth.async_get_or_create_user(credentials)
-            except ValueError as err:
-                _LOGGER.error("Failed to create user %s: %s", username, err)
-            else:
-                if user:
-                    _LOGGER.info("Created Home Assistant user %s via OpenID", username)
-
-        if user is None:
-            _LOGGER.warning("User %s not found in Home Assistant", username)
+        try:
+            user = await async_resolve_user(
+                self.hass,
+                credentials=credentials,
+                credential_data=credential_data,
+                create_user=bool(conf.get(CONF_CREATE_USER, False)),
+            )
+        except AmbiguousAccountError as err:
+            _LOGGER.warning("Refusing ambiguous username match: %s", err)
             return _show_error(
                 self.hass,
                 params,
                 alert_type="error",
                 alert_message=(
-                    "OpenID login succeeded, but user was not created in Home Assistant. "
-                    "Ask your administrator to enable automatic user creation or to add your account."
+                    "OpenID login failed! More than one Home Assistant account has credentials matching this username."
+                ),
+            )
+        except AccountLinkError as err:
+            _LOGGER.error("Home Assistant account linking failed: %s", err)
+            return _show_error(
+                self.hass,
+                params,
+                alert_type="error",
+                alert_message=(
+                    "OpenID login failed! The matching Home Assistant account could not be linked."
+                ),
+            )
+
+        if user is None:
+            _LOGGER.warning("OpenID user did not match a Home Assistant account")
+            return _show_error(
+                self.hass,
+                params,
+                alert_type="error",
+                alert_message=(
+                    "OpenID login succeeded, but no matching Home Assistant account was found. "
+                    "Ask your administrator to add your account or enable automatic user creation."
                 ),
             )
 
@@ -850,41 +829,9 @@ class OpenIDCallbackView(HomeAssistantView):
             _LOGGER.warning("Unable to create person for user %s: %s", user.id, err)
 
     async def _async_find_user_by_username(self, username: str) -> User | None:
-        """Return the single user whose credential username matches."""
-        normalized_username = normalize_username(username)
-        openid_matches: dict[str, User] = {}
-        other_matches: dict[str, User] = {}
+        """Compatibility wrapper for credential-only username matching."""
+        return await async_find_user_by_username(self.hass, username)
 
-        for candidate in await self.hass.auth.async_get_users():
-            for existing_credentials in candidate.credentials:
-                try:
-                    stored_username = normalize_username(
-                        existing_credentials.data.get("username")
-                    )
-                except ValueError:
-                    continue
-
-                if stored_username != normalized_username:
-                    continue
-
-                matches = (
-                    openid_matches
-                    if existing_credentials.auth_provider_type == DOMAIN
-                    else other_matches
-                )
-                matches[candidate.id] = candidate
-
-        if len(openid_matches) > 1:
-            raise ValueError("multiple OpenID credentials match the username")
-        if openid_matches:
-            return next(iter(openid_matches.values()))
-
-        if len(other_matches) > 1:
-            raise ValueError("multiple non-OpenID credentials match the username")
-        if other_matches:
-            return next(iter(other_matches.values()))
-
-        return None
 
 class OpenIDSessionView(HomeAssistantView):
     """Create a short-lived server-side IdP logout ticket."""

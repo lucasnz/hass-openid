@@ -13,6 +13,7 @@ from custom_components.openid.config_flow import (
     OpenIDConfigFlow,
 )
 from custom_components.openid.const import (
+    CONF_ALLOW_LEGACY_OAUTH,
     CONF_AUTHORIZE_URL,
     CONF_CONFIGURE_URL,
     CONF_ID_TOKEN_SIGNING_ALGORITHMS,
@@ -70,11 +71,27 @@ async def test_manual_oauth_without_openid_does_not_require_oidc_metadata() -> N
             CONF_TOKEN_URL: "https://idp.example/token",
             CONF_USER_INFO_URL: "https://idp.example/userinfo",
             CONF_SCOPE: "profile email",
+            CONF_ALLOW_LEGACY_OAUTH: True,
         },
     )
 
     assert CONF_ISSUER not in prepared
     assert CONF_JWKS_URL not in prepared
+
+
+@pytest.mark.asyncio
+async def test_oauth_userinfo_mode_requires_explicit_opt_in() -> None:
+    """Removing openid scope cannot silently downgrade identity validation."""
+    with pytest.raises(RuntimeError, match="explicitly enabled"):
+        await _async_prepare_config(
+            cast(HomeAssistant, object()),
+            {
+                CONF_AUTHORIZE_URL: "https://idp.example/authorize",
+                CONF_TOKEN_URL: "https://idp.example/token",
+                CONF_USER_INFO_URL: "https://idp.example/userinfo",
+                CONF_SCOPE: "profile email",
+            },
+        )
 
 
 @pytest.mark.asyncio

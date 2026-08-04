@@ -110,7 +110,7 @@ def test_unavailable_provider_refresh_token_is_revoked_and_rejected(
     openid._activate_runtime_patches(hass)
     stale_token = SimpleNamespace(
         credential=SimpleNamespace(
-            auth_provider_type="auth_oidc",
+            auth_provider_type=DOMAIN,
             auth_provider_id="default",
         )
     )
@@ -125,3 +125,22 @@ def test_unavailable_provider_refresh_token_is_revoked_and_rejected(
     openid._restore_runtime_patches(hass)
     assert hass.auth.async_create_access_token is original_create
     assert hass.auth.async_remove_refresh_token is original_remove
+
+
+def test_unavailable_non_openid_provider_keeps_core_behavior(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The compatibility patch must not alter other providers' failures."""
+    hass, original_remove, original_create = _fake_hass()
+    original_create.side_effect = InvalidProvider("provider unavailable")
+    monkeypatch.setattr(openid, "override_authorize_route", lambda _hass: lambda: None)
+    monkeypatch.setattr(openid, "override_authorize_login_flow", lambda _hass: lambda: None)
+    openid._activate_runtime_patches(hass)
+    token = SimpleNamespace(
+        credential=SimpleNamespace(
+            auth_provider_type="other_provider", auth_provider_id="default"
+        )
+    )
+    with pytest.raises(InvalidProvider):
+        hass.auth.async_create_access_token(token, "192.0.2.1")
+    original_remove.assert_not_called()
