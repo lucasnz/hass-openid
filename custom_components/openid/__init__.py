@@ -317,9 +317,10 @@ def _activate_runtime_patches(hass: HomeAssistant) -> None:
             credential = getattr(refresh_token, "credential", None)
             provider_type = getattr(credential, "auth_provider_type", None)
             provider_id = getattr(credential, "auth_provider_id", None)
+            if provider_type != DOMAIN:
+                raise
             _LOGGER.warning(
-                "Removing stale refresh token for unavailable auth provider %s, %s",
-                provider_type,
+                "Removing stale refresh token for unavailable OpenID provider %s",
                 provider_id,
             )
             try:
@@ -474,7 +475,7 @@ async def _async_setup_shared(hass: HomeAssistant) -> None:
             StaticPathConfig(
                 "/openid/style.css",
                 str(Path(__file__).parent / "style.css"),
-                cache_headers=True,
+                cache_headers=False,
             ),
             StaticPathConfig(
                 "/openid/logout.js",

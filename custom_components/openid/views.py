@@ -389,7 +389,7 @@ class OpenIDAuthorizeView(HomeAssistantView):
             client_state=escape(client_state, quote=True),
             cancel_url="/",
         )
-        return Response(status=HTTPStatus.OK, text=html, content_type="text/html")
+        return html_response(html)
 
 
 class OpenIDConsentView(HomeAssistantView):
@@ -486,6 +486,7 @@ class OpenIDCallbackView(HomeAssistantView):
                 status=HTTPStatus.FORBIDDEN,
                 text="Invalid OAuth client or redirect URI",
             )
+        params["_validated_redirect_uri"] = params["redirect_uri"]
 
         conf = get_active_config(self.hass)
         if conf is None:
@@ -811,24 +812,10 @@ class OpenIDCallbackView(HomeAssistantView):
             "storeToken": "true",
         }
 
-        if "provider_id" not in existing_params:
-            callback_params["provider_id"] = "homeassistant"
-            _LOGGER.debug("Adding provider_id to callback params")
-        else:
-            _LOGGER.debug(
-                "provider_id already in redirect_uri: %s",
-                existing_params.get("provider_id"),
-            )
-
-        if oauth_client_state:
-            callback_params["state"] = oauth_client_state
-        else:
-            generated_state = secrets.token_urlsafe(16)
-            callback_params["state"] = generated_state
-            _LOGGER.debug(
-                "Client did not provide state, generating one for compatibility: %s",
-                generated_state,
-            )
+        callback_params["provider_id"] = "homeassistant"
+        callback_params["state"] = (
+            oauth_client_state or secrets.token_urlsafe(16)
+        )
 
         all_params = {**existing_params, **callback_params}
         callback_url = str(parsed_url.with_query(all_params))
@@ -1117,32 +1104,28 @@ class OpenIDAndroidStatusView(HomeAssistantView):
         return json_response({"status": "pending"})
 
 def _show_error(
-    hass,
+    hass: HomeAssistant,
     params: Mapping[str, str],
     alert_type: str,
     alert_message: str,
 ) -> Response:
-    """Render the configured OpenID error response."""
+    """Render an escaped error page with only a validated return target."""
     conf = get_active_config(hass) or {}
-    alert_type = alert_type.replace("'", "&#39;").replace('"', "&quot;")
-    alert_message = alert_message.replace("'", "&#39;").replace('"', "&quot;")
-    redirect_url = params.get("redirect_uri", "/").replace("auth_callback=1", "")
-    safe_redirect_url = redirect_url.replace("'", "%27").replace('"', "%22")
-
     error_url = conf.get(CONF_ERROR_URL)
-    if error_url is not None:
-        full_error_url = (
-            f"{error_url}?alert_type={quote(alert_type)}"
-            f"&alert_message={quote(alert_message)}"
+    if isinstance(error_url, str):
+        return redirect_response(
+            str(
+                URL(error_url).update_query(
+                    {"alert_type": alert_type, "alert_message": alert_message}
+                )
+            )
         )
-        return Response(status=HTTPStatus.FOUND, headers={"Location": full_error_url})
 
-    template_content = hass.data[DOMAIN]["error_template"]
-    template = Template(template_content)
+    redirect_url = params.get("_validated_redirect_uri") or "/auth/authorize"
+    template = Template(hass.data[DOMAIN]["error_template"])
     html = template.substitute(
-        alert_type=alert_type,
-        alert_message=alert_message,
-        redirect_url=safe_redirect_url,
+        alert_type=escape(alert_type, quote=True),
+        alert_message=escape(alert_message, quote=True),
+        redirect_url=escape(redirect_url, quote=True),
     )
-
-    return Response(status=HTTPStatus.OK, content_type="text/html", text=html)
+    return html_response(html)
