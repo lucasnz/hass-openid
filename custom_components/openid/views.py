@@ -12,7 +12,7 @@ import logging
 import secrets
 from string import Template
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from aiohttp.web import Request, Response
 from yarl import URL
@@ -45,6 +45,7 @@ from .config_helpers import get_active_config
 from .const import (
     CONF_AUTHORIZE_URL,
     CONF_BLOCK_LOGIN,
+    CONF_CA_CERT_PATH,
     CONF_CREATE_USER,
     CONF_ERROR_URL,
     CONF_ID_TOKEN_SIGNING_ALGORITHMS,
@@ -63,6 +64,7 @@ from .const import (
     CRED_SUBJECT,
     DOMAIN,
 )
+from .network import validate_provider_url
 from .http_security import (
     empty_response,
     html_response,
@@ -92,13 +94,11 @@ _LOGGER = logging.getLogger(__name__)
 _PKCE_VERIFIER_KEY = "pkce_code_verifier"
 _OIDC_NONCE_KEY = "oidc_nonce"
 _ANDROID_TRANSACTION_KEY = "android_transaction_id"
-_ANDROID_POLL_COOKIE = "openid_android_poll"
+_CORRELATION_ID_KEY = "correlation_id"
+_ANDROID_POLL_COOKIE_PREFIX = "openid_android_poll_"
 _ALLOWED_PROMPTS = {"login", "consent", "select_account"}
-
-
-def _short_id(value: str | None) -> str:
-    """Return a safe correlation identifier for logs."""
-    return f"{value[:8]}..." if value else "<missing>"
+_MAX_BACKCHANNEL_BODY_BYTES = 64 * 1024
+_MAX_CONSENT_BODY_BYTES = 8 * 1024
 
 
 async def _validate_client_request(
@@ -145,19 +145,31 @@ def _generate_pkce_pair() -> tuple[str, str]:
 def _configured_callback_base_url(hass: HomeAssistant) -> str:
     """Return a Home Assistant configured URL for the provider callback."""
     with suppress(NoURLAvailableError):
-        return get_url(
-            hass,
-            allow_internal=False,
-            allow_external=True,
-            prefer_external=True,
+        return validate_provider_url(
+            get_url(
+                hass,
+                allow_internal=False,
+                allow_external=True,
+                prefer_external=True,
+            ),
+            field="Home Assistant external callback URL",
         )
 
-    return get_url(
-        hass,
-        allow_internal=True,
-        allow_external=False,
-        allow_cloud=False,
+    return validate_provider_url(
+        get_url(
+            hass,
+            allow_internal=True,
+            allow_external=False,
+            allow_cloud=False,
+        ),
+        field="Home Assistant internal callback URL",
     )
+
+
+def _android_poll_cookie_name(transaction_id: str) -> str:
+    """Return an isolated cookie name for one Android transaction."""
+    suffix = sha256(transaction_id.encode()).hexdigest()[:20]
+    return f"{_ANDROID_POLL_COOKIE_PREFIX}{suffix}"
 
 
 def _android_waiting_response(
@@ -176,7 +188,7 @@ def _android_waiting_response(
     )
     response = html_response(html)
     response.set_cookie(
-        _ANDROID_POLL_COOKIE,
+        _android_poll_cookie_name(transaction_id),
         poll_secret,
         max_age=ANDROID_STATE_TTL,
         httponly=True,
@@ -192,10 +204,17 @@ def _is_android_client(client_id: str | None) -> bool:
     return client_id == "https://home-assistant.io/android"
 
 
-def _request_rate_key(request: Request, purpose: str, client_id: str = "") -> str:
-    """Return a non-secret key for public authentication rate limits."""
+def _request_rate_key(
+    request: Request,
+    purpose: str,
+    client_id: str | None = None,
+) -> str:
+    """Return a bounded non-secret key for public authentication rate limits."""
     remote = request.remote or "unknown"
-    return f"{purpose}:{remote}:{client_id[:256]}"
+    if not client_id:
+        return f"{purpose}:{remote}"
+    client_digest = sha256(client_id.encode()).hexdigest()[:16]
+    return f"{purpose}:{remote}:{client_digest}"
 
 
 def _request_parameters_are_bounded(params: Mapping[str, str]) -> bool:
@@ -206,6 +225,9 @@ def _request_parameters_are_bounded(params: Mapping[str, str]) -> bool:
         "client_id": 2048,
         "redirect_uri": 4096,
         "prompt": 64,
+        "code": 8192,
+        "error": 256,
+        "error_description": 2048,
     }
     return all(
         not isinstance(params.get(key), str) or len(params[key]) <= maximum
@@ -224,7 +246,7 @@ async def _begin_provider_authorization(
     client_id = stored_params.get("client_id")
     if not check_rate_limit(
         hass,
-        _request_rate_key(request, "authorize", client_id or ""),
+        _request_rate_key(request, "authorize", client_id),
         limit=30,
         window=5 * 60,
     ):
@@ -238,14 +260,15 @@ async def _begin_provider_authorization(
 
     try:
         base_url = _configured_callback_base_url(hass)
-    except NoURLAvailableError:
+    except (NoURLAvailableError, ValueError):
         return html_response(
-            "Home Assistant has no configured internal or external URL",
+            "Home Assistant has no secure configured internal or external URL",
             status=HTTPStatus.SERVICE_UNAVAILABLE,
         )
 
     stored_params["base_url"] = base_url
     redirect_uri = str(URL(base_url).with_path("/auth/openid/callback"))
+    stored_params[_CORRELATION_ID_KEY] = secrets.token_hex(6)
     internal_state = secrets.token_urlsafe(32)
     query: dict[str, str] = {
         "response_type": "code",
@@ -400,6 +423,18 @@ class OpenIDAuthorizeView(HomeAssistantView):
             )
 
         if self.should_show_consent_screen(params):
+            if not check_rate_limit(
+                self.hass,
+                _request_rate_key(
+                    request, "consent-screen", params.get("client_id")
+                ),
+                limit=15,
+                window=5 * 60,
+            ):
+                return text_response(
+                    "Too many consent requests; try again shortly",
+                    status=HTTPStatus.TOO_MANY_REQUESTS,
+                )
             _LOGGER.info(
                 "Showing consent screen for client_id: %s", params.get("client_id")
             )
@@ -415,23 +450,25 @@ class OpenIDAuthorizeView(HomeAssistantView):
     ) -> Response:
         """Show the OAuth consent screen to the user."""
         consent_state = secrets.token_urlsafe(24)
-        store_pending(
-            self.hass,
-            CONSENT_STATE_STORE,
-            consent_state,
-            dict(params),
-        )
+        try:
+            store_pending(
+                self.hass,
+                CONSENT_STATE_STORE,
+                consent_state,
+                dict(params),
+            )
+        except StateStoreFull:
+            return html_response(
+                "Too many consent requests are pending; try again shortly",
+                status=HTTPStatus.TOO_MANY_REQUESTS,
+            )
 
-        client_state = params.get("client_state") or params.get("state") or ""
         template = Template(self.hass.data[DOMAIN]["consent_template"])
         html = template.substitute(
             state=escape(consent_state, quote=True),
             client_id=escape(
                 params.get("client_id", "Unknown Application"), quote=True
             ),
-            redirect_uri=escape(params.get("redirect_uri", ""), quote=True),
-            base_url=escape(params.get("base_url", ""), quote=True),
-            client_state=escape(client_state, quote=True),
             cancel_url="/",
         )
         return html_response(html)
@@ -457,19 +494,44 @@ class OpenIDConsentView(HomeAssistantView):
                 status=HTTPStatus.SERVICE_UNAVAILABLE,
             )
 
-        form_data = await request.post()
+        if (
+            request.content_length is not None
+            and request.content_length > _MAX_CONSENT_BODY_BYTES
+        ):
+            return empty_response(status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+        if request.content_type != "application/x-www-form-urlencoded":
+            return empty_response(status=HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+        if not check_rate_limit(
+            self.hass,
+            _request_rate_key(request, "consent-submit"),
+            limit=30,
+            window=5 * 60,
+        ):
+            return empty_response(status=HTTPStatus.TOO_MANY_REQUESTS)
 
-        consent_state = form_data.get("state")
-        if not consent_state:
-            _LOGGER.error("Consent form submitted without state")
+        body = await request.content.read(_MAX_CONSENT_BODY_BYTES + 1)
+        if len(body) > _MAX_CONSENT_BODY_BYTES:
+            return empty_response(status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+        try:
+            fields = parse_qs(
+                body.decode("utf-8"),
+                keep_blank_values=True,
+                max_num_fields=2,
+            )
+        except (UnicodeDecodeError, ValueError):
+            return text_response("Invalid request", status=HTTPStatus.BAD_REQUEST)
+
+        consent_states = fields.get("state", [])
+        if len(consent_states) != 1 or not consent_states[0]:
+            _LOGGER.error("Consent form submitted without exactly one state")
             return text_response("Invalid request", status=HTTPStatus.BAD_REQUEST)
 
         original_params = pop_pending(
-            self.hass, CONSENT_STATE_STORE, str(consent_state)
+            self.hass, CONSENT_STATE_STORE, consent_states[0]
         )
 
         if not original_params:
-            _LOGGER.error("Invalid or expired consent state %s", _short_id(str(consent_state)))
+            _LOGGER.warning("Invalid or expired consent state")
             return text_response(
                 "Invalid or expired consent",
                 status=HTTPStatus.BAD_REQUEST,
@@ -502,21 +564,23 @@ class OpenIDCallbackView(HomeAssistantView):
     async def get(self, request: Request) -> Response:  # noqa: C901
         """Handle redirect from IdP, exchange code for tokens."""
         params = dict(request.rel_url.query)
+        if not _request_parameters_are_bounded(params):
+            return empty_response(status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+
         code = params.get("code")
         state = params.get("state")
-
-        if not code or not state:
-            _LOGGER.warning("OpenID callback was missing code or state")
+        if not state:
+            _LOGGER.warning("OpenID callback was missing state")
             return _show_error(
                 self.hass,
                 params,
                 alert_type="error",
-                alert_message="OpenID login failed! Missing code or state parameter.",
+                alert_message="OpenID login failed! Missing state parameter.",
             )
 
         pending = pop_pending(self.hass, AUTH_STATE_STORE, state)
         if not pending:
-            _LOGGER.warning("Invalid or expired OpenID state %s", _short_id(state))
+            _LOGGER.warning("Invalid or expired OpenID state")
             return _show_error(
                 self.hass,
                 params,
@@ -525,7 +589,40 @@ class OpenIDCallbackView(HomeAssistantView):
             )
 
         oauth_client_state = pending.get("client_state") or pending.get("state")
-        params = {**params, **pending}
+        callback_params = params
+        params = dict(pending)
+        for key in ("error", "error_description", "session_state"):
+            if key in callback_params:
+                params[key] = callback_params[key]
+        correlation_id = params.get(_CORRELATION_ID_KEY, "unknown")
+
+        if params.get("error"):
+            _LOGGER.warning(
+                "Provider rejected OpenID transaction %s",
+                correlation_id,
+            )
+            if await _validate_client_request(self.hass, params):
+                params["_validated_redirect_uri"] = params["redirect_uri"]
+            return _show_error(
+                self.hass,
+                params,
+                alert_type="error",
+                alert_message=(
+                    "OpenID login was cancelled or rejected by the provider."
+                ),
+            )
+
+        if not code:
+            _LOGGER.warning(
+                "OpenID callback was missing a code for transaction %s",
+                correlation_id,
+            )
+            return _show_error(
+                self.hass,
+                params,
+                alert_type="error",
+                alert_message="OpenID login failed! Missing code parameter.",
+            )
         if not await _validate_client_request(self.hass, params):
             _LOGGER.warning("Rejected invalid OAuth client during callback")
             return text_response(
@@ -558,7 +655,7 @@ class OpenIDCallbackView(HomeAssistantView):
         except ProviderAuthenticationError as err:
             _LOGGER.warning(
                 "Provider identity validation failed for transaction %s: %s",
-                _short_id(state),
+                correlation_id,
                 err,
             )
             return _show_error(
@@ -567,9 +664,21 @@ class OpenIDCallbackView(HomeAssistantView):
                 alert_type="error",
                 alert_message=err.public_message,
             )
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception(
+                "Unexpected OpenID callback failure for transaction %s",
+                correlation_id,
+            )
+            return _show_error(
+                self.hass,
+                params,
+                alert_type="error",
+                alert_message=(
+                    "OpenID login failed because of an unexpected internal error."
+                ),
+            )
 
         token_data = identity.token_data
-        username = identity.username
         new_credential_fields = identity.credential_fields
 
         provider = self.hass.data[DOMAIN].get("auth_provider")
@@ -617,6 +726,7 @@ class OpenIDCallbackView(HomeAssistantView):
 
         credential_data = dict(credentials.data)
         credential_data.update(new_credential_fields)
+        credential_data.pop("subject", None)
 
         postlogout_url = conf.get(CONF_POST_LOGOUT_URL)
 
@@ -641,7 +751,8 @@ class OpenIDCallbackView(HomeAssistantView):
                 params,
                 alert_type="error",
                 alert_message=(
-                    "OpenID login failed! More than one Home Assistant account has credentials matching this username."
+                    "OpenID login failed! More than one Home Assistant account "
+                    "has credentials matching this username."
                 ),
             )
         except AccountLinkError as err:
@@ -698,10 +809,15 @@ class OpenIDCallbackView(HomeAssistantView):
 
         client_id = params["client_id"]
         url = params["redirect_uri"]
-        _LOGGER.debug("User %s authenticated via OpenID", username)
+        _LOGGER.debug(
+            "OpenID identity validated for transaction %s", correlation_id
+        )
         result = create_auth_code(self.hass, client_id, credentials)
 
-        _LOGGER.debug("Created Home Assistant authorization code")
+        _LOGGER.debug(
+            "Created Home Assistant authorization code for transaction %s",
+            correlation_id,
+        )
         callback_url = self._build_callback_url(url, result, oauth_client_state)
 
         if transaction_id := params.get(_ANDROID_TRANSACTION_KEY):
@@ -763,15 +879,20 @@ class OpenIDCallbackView(HomeAssistantView):
     ) -> None:
         """Persist logout-related metadata for future IdP notifications."""
 
-        if token_data and (id_token := token_data.get("id_token")):
+        id_token = token_data.get("id_token") if token_data else None
+        if isinstance(id_token, str) and id_token:
             credential_data[CRED_ID_TOKEN] = id_token
         else:
             credential_data.pop(CRED_ID_TOKEN, None)
 
-        if session_state_param := params.get("session_state"):
+        session_state_param = params.get("session_state")
+        token_session_state = (
+            token_data.get("session_state") if token_data else None
+        )
+        if isinstance(session_state_param, str) and session_state_param:
             credential_data[CRED_SESSION_STATE] = session_state_param
-        elif token_data and (session_state := token_data.get("session_state")):
-            credential_data[CRED_SESSION_STATE] = session_state
+        elif isinstance(token_session_state, str) and token_session_state:
+            credential_data[CRED_SESSION_STATE] = token_session_state
         else:
             credential_data.pop(CRED_SESSION_STATE, None)
 
@@ -858,6 +979,15 @@ class OpenIDSessionView(HomeAssistantView):
         ]
         if not credentials:
             return empty_response(status=HTTPStatus.NO_CONTENT)
+        if request.rel_url.query.get("probe") == "1":
+            return json_response({"enabled": True})
+        if not check_rate_limit(
+            self.hass,
+            f"logout-ticket:{user.id}",
+            limit=30,
+            window=5 * 60,
+        ):
+            return empty_response(status=HTTPStatus.TOO_MANY_REQUESTS)
 
         # Prefer the credential with current logout metadata. Ambiguity is
         # rejected rather than exposing a token belonging to an arbitrary IdP
@@ -868,9 +998,12 @@ class OpenIDSessionView(HomeAssistantView):
             if candidate.data.get(CRED_ID_TOKEN)
             or candidate.data.get(CRED_SESSION_STATE)
         ]
-        if len(candidates) != 1:
+        if len(candidates) == 1:
+            credential = candidates[0]
+        elif not candidates and len(credentials) == 1:
+            credential = credentials[0]
+        else:
             return empty_response(status=HTTPStatus.NO_CONTENT)
-        credential = candidates[0]
 
         params: dict[str, str] = {}
         if id_token := credential.data.get(CRED_ID_TOKEN):
@@ -916,7 +1049,7 @@ class OpenIDLogoutView(HomeAssistantView):
     async def get(self, request: Request) -> Response:
         """Consume an opaque logout ticket without exposing ID tokens to JS."""
         ticket = request.rel_url.query.get("ticket")
-        if not ticket:
+        if not ticket or len(ticket) > 512:
             return html_response(
                 "Invalid or expired logout request",
                 status=HTTPStatus.BAD_REQUEST,
@@ -949,8 +1082,20 @@ class OpenIDBackchannelLogoutView(HomeAssistantView):
 
     async def post(self, request: Request) -> Response:
         """Validate a logout token and revoke matching HA refresh tokens."""
-        if request.content_length is not None and request.content_length > 65536:
+        if (
+            request.content_length is not None
+            and request.content_length > _MAX_BACKCHANNEL_BODY_BYTES
+        ):
             return empty_response(status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+        if request.content_type != "application/x-www-form-urlencoded":
+            return empty_response(status=HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+        if not check_rate_limit(
+            self.hass,
+            _request_rate_key(request, "backchannel-logout"),
+            limit=60,
+            window=5 * 60,
+        ):
+            return empty_response(status=HTTPStatus.TOO_MANY_REQUESTS)
         conf = get_active_config(self.hass)
         if not conf or not all(
             conf.get(key)
@@ -958,10 +1103,21 @@ class OpenIDBackchannelLogoutView(HomeAssistantView):
         ):
             return empty_response(status=HTTPStatus.NOT_FOUND)
 
-        form = await request.post()
-        logout_token = form.get("logout_token")
-        if not isinstance(logout_token, str) or not logout_token:
+        body = await request.content.read(_MAX_BACKCHANNEL_BODY_BYTES + 1)
+        if len(body) > _MAX_BACKCHANNEL_BODY_BYTES:
+            return empty_response(status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+        try:
+            fields = parse_qs(
+                body.decode("utf-8"),
+                keep_blank_values=True,
+                max_num_fields=4,
+            )
+        except (UnicodeDecodeError, ValueError):
             return empty_response(status=HTTPStatus.BAD_REQUEST)
+        logout_tokens = fields.get("logout_token", [])
+        if len(logout_tokens) != 1 or not logout_tokens[0]:
+            return empty_response(status=HTTPStatus.BAD_REQUEST)
+        logout_token = logout_tokens[0]
 
         algorithms = conf.get(CONF_ID_TOKEN_SIGNING_ALGORITHMS, ["RS256"])
         if isinstance(algorithms, str):
@@ -975,8 +1131,11 @@ class OpenIDBackchannelLogoutView(HomeAssistantView):
                 client_id=conf[CONF_CLIENT_ID],
                 algorithms=list(algorithms),
                 validate_tls=bool(conf.get(CONF_VALIDATE_TLS, True)),
+                ca_cert_path=conf.get(CONF_CA_CERT_PATH),
             )
             jti = claims["jti"]
+            if not isinstance(jti, str) or not jti or len(jti) > 512:
+                raise ValueError("Logout token jti is invalid")
             if get_pending(
                 self.hass,
                 LOGOUT_TOKEN_JTI_STORE,
@@ -990,6 +1149,7 @@ class OpenIDBackchannelLogoutView(HomeAssistantView):
                 jti,
                 {"used": True},
                 ttl=LOGOUT_TOKEN_JTI_TTL,
+                max_entries=4096,
             )
         except (ValueError, LookupError, StateStoreFull):
             _LOGGER.warning("Rejected invalid or replayed OIDC logout token")
@@ -1002,14 +1162,18 @@ class OpenIDBackchannelLogoutView(HomeAssistantView):
         session_id = claims.get("sid")
         issuer = claims.get("iss")
         revoked = 0
-        for user in await self.hass.auth.async_get_users():
+        users = await self.hass.auth.async_get_users()
+        for user in users:
             matching_credentials = [
                 credential
                 for credential in user.credentials
                 if credential.auth_provider_type == DOMAIN
                 and credential.data.get(CRED_ISSUER) == issuer
                 and (
-                    (subject is not None and credential.data.get(CRED_SUBJECT) == subject)
+                    (
+                        subject is not None
+                        and credential.data.get(CRED_SUBJECT) == subject
+                    )
                     or (
                         session_id is not None
                         and credential.data.get(CRED_SESSION_ID) == session_id
@@ -1018,6 +1182,7 @@ class OpenIDBackchannelLogoutView(HomeAssistantView):
             ]
             if not matching_credentials:
                 continue
+
             refresh_tokens = getattr(user, "refresh_tokens", {})
             tokens = (
                 list(refresh_tokens.values())
@@ -1026,9 +1191,21 @@ class OpenIDBackchannelLogoutView(HomeAssistantView):
             )
             for refresh_token in tokens:
                 token_credential = getattr(refresh_token, "credential", None)
-                if any(token_credential is candidate for candidate in matching_credentials):
+                if any(
+                    token_credential is candidate
+                    for candidate in matching_credentials
+                ):
                     self.hass.auth.async_remove_refresh_token(refresh_token)
                     revoked += 1
+
+            for credential in matching_credentials:
+                updated = dict(credential.data)
+                updated.pop(CRED_ID_TOKEN, None)
+                updated.pop(CRED_SESSION_STATE, None)
+                updated.pop(CRED_SESSION_ID, None)
+                self.hass.auth.async_update_user_credentials_data(
+                    credential, updated
+                )
 
         _LOGGER.info("Processed OIDC back-channel logout; revoked %d session(s)", revoked)
         return empty_response(status=HTTPStatus.NO_CONTENT)
@@ -1048,18 +1225,24 @@ class OpenIDAndroidStatusView(HomeAssistantView):
     async def get(self, request: Request) -> Response:
         """Return completion status for a given OAuth state."""
         transaction_id = request.rel_url.query.get("transaction")
+        if not transaction_id or len(transaction_id) > 512:
+            return json_response(
+                {"status": "error", "message": "Invalid transaction"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
         if not check_rate_limit(
             self.hass,
-            _request_rate_key(request, "android-status", transaction_id or ""),
-            limit=120,
+            _request_rate_key(request, "android-status"),
+            limit=600,
             window=5 * 60,
         ):
             return json_response(
                 {"status": "error", "message": "Too many requests"},
                 status=HTTPStatus.TOO_MANY_REQUESTS,
             )
-        poll_secret = request.cookies.get(_ANDROID_POLL_COOKIE)
-        if not transaction_id or not poll_secret:
+        cookie_name = _android_poll_cookie_name(transaction_id)
+        poll_secret = request.cookies.get(cookie_name)
+        if not poll_secret or len(poll_secret) > 512:
             return json_response(
                 {"status": "error", "message": "Missing transaction proof"},
                 status=HTTPStatus.FORBIDDEN,
@@ -1086,6 +1269,16 @@ class OpenIDAndroidStatusView(HomeAssistantView):
                 {"status": "error", "message": "Invalid transaction proof"},
                 status=HTTPStatus.FORBIDDEN,
             )
+        if not check_rate_limit(
+            self.hass,
+            _request_rate_key(request, "android-transaction", transaction_id),
+            limit=180,
+            window=5 * 60,
+        ):
+            return json_response(
+                {"status": "error", "message": "Too many requests"},
+                status=HTTPStatus.TOO_MANY_REQUESTS,
+            )
 
         if entry.get("status") == "completed" and entry.get("callback_url"):
             payload = {
@@ -1100,7 +1293,7 @@ class OpenIDAndroidStatusView(HomeAssistantView):
             )
             response = json_response(payload)
             response.del_cookie(
-                _ANDROID_POLL_COOKIE,
+                cookie_name,
                 path="/auth/openid/android/status",
             )
             return response
@@ -1126,10 +1319,22 @@ def _show_error(
         )
 
     redirect_url = params.get("_validated_redirect_uri") or "/auth/authorize"
+    retry_params = {
+        key: params[key]
+        for key in ("client_id", "redirect_uri", "client_state")
+        if isinstance(params.get(key), str) and params[key]
+    }
+    retry_params["prompt"] = "select_account"
+    retry_url = (
+        str(URL("/auth/openid/authorize").with_query(retry_params))
+        if "client_id" in retry_params and "redirect_uri" in retry_params
+        else redirect_url
+    )
     template = Template(hass.data[DOMAIN]["error_template"])
     html = template.substitute(
         alert_type=escape(alert_type, quote=True),
         alert_message=escape(alert_message, quote=True),
         redirect_url=escape(redirect_url, quote=True),
+        retry_url=escape(retry_url, quote=True),
     )
     return html_response(html)

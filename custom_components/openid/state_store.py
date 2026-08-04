@@ -25,7 +25,6 @@ class StateStoreFull(RuntimeError):
     """Raised when no more pending authentication states can be accepted."""
 
 
-
 def _cleanup(store: dict[str, dict[str, Any]], ttl: float) -> None:
     """Remove expired entries from a state store."""
     cutoff = monotonic() - ttl
@@ -41,6 +40,7 @@ def store_pending(
     value: dict[str, Any],
     *,
     ttl: float = AUTH_STATE_TTL,
+    max_entries: int = MAX_PENDING_ENTRIES,
 ) -> None:
     """Store a bounded pending entry without evicting an active flow."""
     if not key or len(key) > MAX_STATE_KEY_LENGTH:
@@ -49,7 +49,7 @@ def store_pending(
     store: dict[str, dict[str, Any]] = hass.data.setdefault(store_name, {})
     _cleanup(store, ttl)
 
-    if key not in store and len(store) >= MAX_PENDING_ENTRIES:
+    if key not in store and len(store) >= max_entries:
         raise StateStoreFull("too many authentication requests are pending")
 
     store[key] = {"created_at": monotonic(), "value": dict(value)}
@@ -64,9 +64,13 @@ def get_pending(
 ) -> dict[str, Any] | None:
     """Return a pending entry when it exists and has not expired."""
     store: dict[str, dict[str, Any]] = hass.data.setdefault(store_name, {})
-    _cleanup(store, ttl)
     entry = store.get(key)
-    return dict(entry["value"]) if entry else None
+    if entry is None:
+        return None
+    if entry.get("created_at", 0.0) < monotonic() - ttl:
+        store.pop(key, None)
+        return None
+    return dict(entry["value"])
 
 
 def pop_pending(
@@ -78,12 +82,41 @@ def pop_pending(
 ) -> dict[str, Any] | None:
     """Remove and return a pending entry when it has not expired."""
     store: dict[str, dict[str, Any]] = hass.data.setdefault(store_name, {})
-    _cleanup(store, ttl)
     entry = store.pop(key, None)
-    return dict(entry["value"]) if entry else None
+    if entry is None or entry.get("created_at", 0.0) < monotonic() - ttl:
+        return None
+    return dict(entry["value"])
 
 RATE_LIMIT_STORE = "_openid_rate_limits"
 MAX_RATE_LIMIT_KEYS = 1024
+
+
+def _recent_rate_limit_timestamps(
+    raw_entry: Any,
+    *,
+    now: float,
+    default_window: float,
+) -> tuple[float, list[float]]:
+    """Return a normalized rate-limit entry, including legacy list entries."""
+    if isinstance(raw_entry, dict):
+        stored_window = raw_entry.get("window", default_window)
+        raw_timestamps = raw_entry.get("timestamps", [])
+    else:
+        stored_window = default_window
+        raw_timestamps = raw_entry if isinstance(raw_entry, list) else []
+
+    try:
+        stored_window = float(stored_window)
+    except (TypeError, ValueError):
+        stored_window = default_window
+    stored_window = max(stored_window, 0.001)
+    cutoff = now - stored_window
+    timestamps = [
+        timestamp
+        for timestamp in raw_timestamps
+        if isinstance(timestamp, (int, float)) and timestamp >= cutoff
+    ]
+    return stored_window, timestamps
 
 
 def check_rate_limit(
@@ -94,21 +127,42 @@ def check_rate_limit(
     window: float,
 ) -> bool:
     """Return whether a request is allowed by a bounded sliding window."""
-    now = monotonic()
-    store: dict[str, list[float]] = hass.data.setdefault(RATE_LIMIT_STORE, {})
-    cutoff = now - window
-    for stored_key, timestamps in list(store.items()):
-        recent = [timestamp for timestamp in timestamps if timestamp >= cutoff]
-        if recent:
-            store[stored_key] = recent
-        else:
-            store.pop(stored_key, None)
+    if not key or limit < 1 or window <= 0:
+        return False
 
-    timestamps = store.get(key, [])
+    now = monotonic()
+    store: dict[str, dict[str, Any] | list[float]] = hass.data.setdefault(
+        RATE_LIMIT_STORE, {}
+    )
+    _stored_window, timestamps = _recent_rate_limit_timestamps(
+        store.get(key),
+        now=now,
+        default_window=window,
+    )
     if len(timestamps) >= limit:
+        store[key] = {"window": window, "timestamps": timestamps}
         return False
+
     if key not in store and len(store) >= MAX_RATE_LIMIT_KEYS:
-        return False
+        # A new key is the only case that requires a global cleanup. Use each
+        # existing key's own window so unrelated endpoints cannot prematurely
+        # expire or retain one another's request history.
+        for stored_key, raw_entry in list(store.items()):
+            stored_window, recent = _recent_rate_limit_timestamps(
+                raw_entry,
+                now=now,
+                default_window=window,
+            )
+            if recent:
+                store[stored_key] = {
+                    "window": stored_window,
+                    "timestamps": recent,
+                }
+            else:
+                store.pop(stored_key, None)
+        if len(store) >= MAX_RATE_LIMIT_KEYS:
+            return False
+
     timestamps.append(now)
-    store[key] = timestamps
+    store[key] = {"window": window, "timestamps": timestamps}
     return True

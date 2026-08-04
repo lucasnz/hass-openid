@@ -1,7 +1,7 @@
 """Tests for atomic installation and restoration of runtime patches."""
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -144,3 +144,80 @@ def test_unavailable_non_openid_provider_keeps_core_behavior(
     with pytest.raises(InvalidProvider):
         hass.auth.async_create_access_token(token, "192.0.2.1")
     original_remove.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_unload_revokes_openid_sessions_and_removes_provider() -> None:
+    """Unloading cannot leave OpenID refresh tokens usable."""
+    openid_credential = SimpleNamespace(auth_provider_type=DOMAIN)
+    other_credential = SimpleNamespace(auth_provider_type="other")
+    openid_token = SimpleNamespace(credential=openid_credential)
+    other_token = SimpleNamespace(credential=other_credential)
+    user = SimpleNamespace(
+        refresh_tokens={"openid": openid_token, "other": other_token}
+    )
+    provider = object()
+    remove = MagicMock()
+    hass = SimpleNamespace(
+        data={
+            DOMAIN: {
+                openid.DATA_ACTIVE_ENTRY_ID: "entry-id",
+                openid.DATA_AUTH_PROVIDER: provider,
+                "active_config": {},
+            }
+        },
+        auth=SimpleNamespace(
+            async_get_users=AsyncMock(return_value=[user]),
+            async_remove_refresh_token=remove,
+            _providers={(DOMAIN, None): provider},
+        ),
+    )
+    entry = SimpleNamespace(entry_id="entry-id")
+
+    assert await openid.async_unload_entry(hass, entry)
+    remove.assert_called_once_with(openid_token)
+    assert other_token not in [call.args[0] for call in remove.call_args_list]
+    assert (DOMAIN, None) not in hass.auth._providers
+
+
+@pytest.mark.asyncio
+async def test_shared_setup_reregisters_provider_after_reload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A config-entry reload restores the provider removed during unload."""
+    provider = object()
+    register = AsyncMock(return_value=provider)
+    monkeypatch.setattr(openid, "async_register_auth_provider", register)
+    hass = SimpleNamespace(
+        data={DOMAIN: {openid.DATA_SHARED_INITIALIZED: True}},
+        auth=SimpleNamespace(_providers={}),
+    )
+
+    await openid._async_setup_shared(hass)
+
+    register.assert_awaited_once_with(hass)
+    assert hass.data[DOMAIN][openid.DATA_AUTH_PROVIDER] is provider
+
+
+@pytest.mark.asyncio
+async def test_shared_setup_keeps_already_registered_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Normal setup followed by entry setup does not recreate the provider."""
+    provider = object()
+    register = AsyncMock()
+    monkeypatch.setattr(openid, "async_register_auth_provider", register)
+    hass = SimpleNamespace(
+        data={
+            DOMAIN: {
+                openid.DATA_SHARED_INITIALIZED: True,
+                openid.DATA_AUTH_PROVIDER: provider,
+            }
+        },
+        auth=SimpleNamespace(_providers={(DOMAIN, None): provider}),
+    )
+
+    await openid._async_setup_shared(hass)
+
+    register.assert_not_awaited()
+    assert hass.data[DOMAIN][openid.DATA_AUTH_PROVIDER] is provider

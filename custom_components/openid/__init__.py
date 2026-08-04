@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
+from functools import wraps
 import logging
 from pathlib import Path
 from typing import Any
 
 import hass_frontend
+from aiohttp import ClientError
 import voluptuous as vol
 
 from homeassistant.auth import InvalidAuthError, InvalidProvider
@@ -17,15 +20,16 @@ from homeassistant.components.http import StaticPathConfig
 from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry
 from homeassistant.const import CONF_CLIENT_ID, CONF_CLIENT_SECRET
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.exceptions import ConfigEntryError, ConfigEntryNotReady
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.typing import ConfigType
 
 from . import views as openid_views
 from .auth_provider import async_register_auth_provider
 from .config_helpers import (
     async_discover_configuration,
-    get_active_config,
+    async_validate_tls_configuration,
     set_active_config,
     validate_runtime_provider_urls,
 )
@@ -33,6 +37,7 @@ from .const import (
     CONF_ALLOW_LEGACY_OAUTH,
     CONF_AUTHORIZE_URL,
     CONF_BLOCK_LOGIN,
+    CONF_CA_CERT_PATH,
     CONF_POST_LOGOUT_URL,
     CONF_CONFIGURE_URL,
     CONF_CREATE_USER,
@@ -66,8 +71,11 @@ from .const import (
     DOMAIN,
 )
 from .http_helper import override_authorize_login_flow, override_authorize_route
+from .network import ProviderResponseError
 
 _LOGGER = logging.getLogger(__name__)
+
+_DISCOVERY_REFRESH_INTERVAL = timedelta(hours=6)
 
 CONFIG_SCHEMA = vol.Schema(
     {
@@ -93,6 +101,7 @@ CONFIG_SCHEMA = vol.Schema(
                 vol.Optional(CONF_BLOCK_LOGIN, default=False): cv.boolean,
                 vol.Optional(CONF_ERROR_URL): cv.url,
                 vol.Optional(CONF_VALIDATE_TLS, default=DEFAULT_VALIDATE_TLS): cv.boolean,
+                vol.Optional(CONF_CA_CERT_PATH): cv.string,
                 vol.Optional(
                     CONF_USE_HEADER_AUTH, default=DEFAULT_USE_HEADER_AUTH
                 ): cv.boolean,
@@ -152,19 +161,56 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     else:
         try:
             runtime_config = await _async_prepare_config(hass, runtime_config)
-        except Exception as err:  # noqa: BLE001
+        except (ClientError, TimeoutError) as err:
             raise ConfigEntryNotReady(
                 "OpenID provider discovery is not currently available"
             ) from err
+        except ProviderResponseError as err:
+            if err.transient:
+                raise ConfigEntryNotReady(
+                    "OpenID provider discovery is temporarily unavailable"
+                ) from err
+            raise ConfigEntryError(
+                "OpenID provider discovery returned an invalid response"
+            ) from err
+        except (RuntimeError, ValueError) as err:
+            raise ConfigEntryError(str(err)) from err
     set_active_config(hass, runtime_config)
     try:
         _activate_runtime_patches(hass)
     except Exception as err:  # noqa: BLE001
         set_active_config(hass, None)
-        raise ConfigEntryNotReady(
-            "OpenID is incompatible with the current Home Assistant authentication routes"
+        raise ConfigEntryError(
+            "OpenID is incompatible with the current Home Assistant "
+            "authentication routes"
         ) from err
     hass.data[DOMAIN][DATA_ACTIVE_ENTRY_ID] = entry.entry_id
+
+    if CONF_CONFIGURE_URL in entry.data and not yaml_config:
+        async def _async_refresh_discovery(_now: Any) -> None:
+            """Refresh discovery metadata without interrupting active sessions."""
+            domain_data = hass.data.get(DOMAIN, {})
+            if domain_data.get(DATA_ACTIVE_ENTRY_ID) != entry.entry_id:
+                return
+            try:
+                refreshed = await _async_prepare_config(hass, dict(entry.data))
+            except Exception:  # noqa: BLE001
+                _LOGGER.warning(
+                    "Unable to refresh OpenID discovery metadata; retaining the "
+                    "last validated configuration",
+                    exc_info=True,
+                )
+                return
+            set_active_config(hass, refreshed)
+
+        entry.async_on_unload(
+            async_track_time_interval(
+                hass,
+                _async_refresh_discovery,
+                _DISCOVERY_REFRESH_INTERVAL,
+            )
+        )
+
     return True
 
 
@@ -175,6 +221,29 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         return True
 
     if domain_data.get(DATA_ACTIVE_ENTRY_ID) == entry.entry_id:
+        # OpenID refresh tokens must not remain usable after the integration is
+        # unloaded. This also makes config-entry reloads explicit: active SSO
+        # sessions are revoked and must authenticate against the new config.
+        for user in await hass.auth.async_get_users():
+            refresh_tokens = getattr(user, "refresh_tokens", {})
+            tokens = (
+                list(refresh_tokens.values())
+                if isinstance(refresh_tokens, dict)
+                else list(refresh_tokens)
+            )
+            for refresh_token in tokens:
+                credential = getattr(refresh_token, "credential", None)
+                if getattr(credential, "auth_provider_type", None) == DOMAIN:
+                    hass.auth.async_remove_refresh_token(refresh_token)
+
+        provider = domain_data.pop(DATA_AUTH_PROVIDER, None)
+        providers = getattr(hass.auth, "_providers", None)  # noqa: SLF001
+        if (
+            isinstance(providers, dict)
+            and providers.get((DOMAIN, None)) is provider
+        ):
+            providers.pop((DOMAIN, None), None)
+
         domain_data.pop(DATA_ACTIVE_ENTRY_ID, None)
         domain_data.pop(DATA_ACTIVE_CONFIG, None)
         _restore_runtime_patches(hass)
@@ -194,55 +263,53 @@ async def _async_prepare_config(
         )
 
     if CONF_CONFIGURE_URL in config:
-        needs_discovery = (
-            any(
-                not config.get(key)
-                for key in (CONF_AUTHORIZE_URL, CONF_TOKEN_URL, CONF_USER_INFO_URL)
-            )
-            or CONF_USE_PKCE not in config
-            or (
-                openid_requested
-                and any(
-                    not config.get(key)
-                    for key in (
-                        CONF_ISSUER,
-                        CONF_JWKS_URL,
-                        CONF_ID_TOKEN_SIGNING_ALGORITHMS,
-                    )
-                )
-            )
+        # Refresh discovery metadata on every setup/reload. This detects issuer
+        # changes and avoids indefinitely trusting stale endpoints.
+        discovered = await async_discover_configuration(
+            hass,
+            config[CONF_CONFIGURE_URL],
+            validate_tls=bool(
+                config.get(CONF_VALIDATE_TLS, DEFAULT_VALIDATE_TLS)
+            ),
+            expected_issuer=config.get(CONF_ISSUER),
+            ca_cert_path=config.get(CONF_CA_CERT_PATH),
         )
-        if needs_discovery:
-            discovered = await async_discover_configuration(
-                hass,
-                config[CONF_CONFIGURE_URL],
-                validate_tls=bool(
-                    config.get(CONF_VALIDATE_TLS, DEFAULT_VALIDATE_TLS)
-                ),
-                expected_issuer=config.get(CONF_ISSUER),
-            )
-            for key in (CONF_AUTHORIZE_URL, CONF_TOKEN_URL, CONF_USER_INFO_URL):
-                if not config.get(key) and discovered.get(key):
-                    config[key] = discovered[key]
+        for key in (
+            CONF_AUTHORIZE_URL,
+            CONF_TOKEN_URL,
+            CONF_USER_INFO_URL,
+            CONF_ISSUER,
+            CONF_JWKS_URL,
+            CONF_ID_TOKEN_SIGNING_ALGORITHMS,
+        ):
+            config[key] = discovered[key]
 
-            if not config.get(CONF_LOGOUT_URL) and discovered.get(CONF_LOGOUT_URL):
-                config[CONF_LOGOUT_URL] = discovered[CONF_LOGOUT_URL]
-
-            for key in (
-                CONF_ISSUER,
-                CONF_JWKS_URL,
-                CONF_ID_TOKEN_SIGNING_ALGORITHMS,
-            ):
-                if not config.get(key) and discovered.get(key):
-                    config[key] = discovered[key]
-
-            if CONF_USE_PKCE not in config:
-                config[CONF_USE_PKCE] = bool(discovered[DISCOVERY_PKCE_AVAILABLE])
+        if discovered.get(CONF_LOGOUT_URL):
+            config[CONF_LOGOUT_URL] = discovered[CONF_LOGOUT_URL]
+        else:
+            config.pop(CONF_LOGOUT_URL, None)
+        if CONF_USE_PKCE not in config:
+            config[CONF_USE_PKCE] = bool(discovered[DISCOVERY_PKCE_AVAILABLE])
 
     required_keys = [CONF_AUTHORIZE_URL, CONF_TOKEN_URL, CONF_USER_INFO_URL]
     if openid_requested:
         required_keys.extend((CONF_ISSUER, CONF_JWKS_URL))
-        config.setdefault(CONF_ID_TOKEN_SIGNING_ALGORITHMS, ["RS256"])
+        algorithms = config.setdefault(CONF_ID_TOKEN_SIGNING_ALGORITHMS, ["RS256"])
+        if isinstance(algorithms, str):
+            algorithms = [algorithms]
+        algorithms = [
+            value
+            for value in algorithms
+            if isinstance(value, str)
+            and value
+            and value != "none"
+            and not value.startswith("HS")
+        ]
+        if not algorithms:
+            raise RuntimeError(
+                "At least one asymmetric ID token signing algorithm is required"
+            )
+        config[CONF_ID_TOKEN_SIGNING_ALGORITHMS] = algorithms
 
     missing = [key for key in required_keys if not config.get(key)]
     if missing:
@@ -252,6 +319,7 @@ async def _async_prepare_config(
         )
 
     validate_runtime_provider_urls(config)
+    await async_validate_tls_configuration(hass, config)
     return config
 
 
@@ -261,13 +329,8 @@ def _activate_runtime_patches(hass: HomeAssistant) -> None:
     if domain_data.get("_runtime_patches_active"):
         return
 
-    async def _async_notify_idp_logout(credential: Credentials) -> None:
-        """Clear logout-related metadata from credentials."""
-        config = get_active_config(hass)
-        logout_url: str | None = config.get(CONF_LOGOUT_URL) if config else None
-        if not logout_url:
-            return
-
+    async def _async_clear_logout_metadata(credential: Credentials) -> None:
+        """Clear local logout-related metadata from credentials."""
         cleared = False
         if credential.data.pop(CRED_ID_TOKEN, None) is not None:
             cleared = True
@@ -282,14 +345,15 @@ def _activate_runtime_patches(hass: HomeAssistant) -> None:
     original_remove_refresh_token = hass.auth.async_remove_refresh_token
     original_create_access_token = hass.auth.async_create_access_token
 
-    def _patched_remove_refresh_token(refresh_token: Any) -> None:
+    @wraps(original_remove_refresh_token)
+    def _patched_remove_refresh_token(
+        refresh_token: Any, *args: Any, **kwargs: Any
+    ) -> None:
         credential = getattr(refresh_token, "credential", None)
         if (
             credential is not None
             and getattr(credential, "auth_provider_type", None) == DOMAIN
         ):
-            config = get_active_config(hass)
-            logout_url = config.get(CONF_LOGOUT_URL) if config else None
             has_logout_metadata = any(
                 credential.data.get(key)
                 for key in (
@@ -298,21 +362,21 @@ def _activate_runtime_patches(hass: HomeAssistant) -> None:
                     CRED_LOGOUT_REDIRECT_URI,
                 )
             )
-            if logout_url and has_logout_metadata:
+            if has_logout_metadata:
                 hass.async_create_background_task(
-                    _async_notify_idp_logout(credential),
-                    name="openid_notify_idp_logout",
+                    _async_clear_logout_metadata(credential),
+                    name="openid_clear_logout_metadata",
                 )
 
-        original_remove_refresh_token(refresh_token)
+        original_remove_refresh_token(refresh_token, *args, **kwargs)
 
+    @wraps(original_create_access_token)
     def _patched_create_access_token(
-        refresh_token: Any,
-        remote_ip: str | None = None,
+        refresh_token: Any, *args: Any, **kwargs: Any
     ) -> str:
         """Reject and revoke tokens whose original auth provider was removed."""
         try:
-            return original_create_access_token(refresh_token, remote_ip)
+            return original_create_access_token(refresh_token, *args, **kwargs)
         except InvalidProvider as err:
             credential = getattr(refresh_token, "credential", None)
             provider_type = getattr(credential, "auth_provider_type", None)
@@ -425,6 +489,16 @@ async def _async_setup_shared(hass: HomeAssistant) -> None:
     """Set up shared OpenID runtime resources."""
     domain_data = hass.data.setdefault(DOMAIN, {})
     if domain_data.get(DATA_SHARED_INITIALIZED):
+        # The provider is deliberately removed during unload. Views and static
+        # resources remain process-global, so a reload only needs to restore the
+        # provider when it is no longer registered.
+        provider = domain_data.get(DATA_AUTH_PROVIDER)
+        providers = getattr(hass.auth, "_providers", None)  # noqa: SLF001
+        if (
+            not isinstance(providers, dict)
+            or providers.get((DOMAIN, None)) is not provider
+        ):
+            domain_data[DATA_AUTH_PROVIDER] = await async_register_auth_provider(hass)
         return
 
     hass.data.setdefault("_openid_state", {})

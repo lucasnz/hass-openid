@@ -49,7 +49,7 @@
       // Ignore a transient same-origin polling failure.
     }
 
-    window.setTimeout(poll, 1000);
+    window.setTimeout(poll, 2000);
   };
 
   void poll();

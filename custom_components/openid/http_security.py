@@ -15,6 +15,9 @@ NO_STORE_HEADERS: dict[str, str] = {
     "Referrer-Policy": "no-referrer",
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Cross-Origin-Resource-Policy": "same-origin",
+    "Permissions-Policy": "camera=(), geolocation=(), microphone=()",
 }
 
 HTML_SECURITY_HEADERS: dict[str, str] = {

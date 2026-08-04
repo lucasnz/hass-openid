@@ -11,7 +11,11 @@
       "invalid_discovery": "The discovery endpoint did not return the required OpenID endpoints",
       "invalid_ssl_certificate": "TLS certificate validation failed while connecting to the provider",
       "required_fields": "Review the discovered endpoints and fill in any missing values",
-      "missing_oidc_metadata": "Issuer and JWKS URL are required when the requested scope includes openid"
+      "missing_oidc_metadata": "Issuer and JWKS URL are required when the requested scope includes openid",
+      "invalid_tls_configuration": "Keep TLS validation enabled when using a custom CA certificate",
+      "invalid_ca_certificate": "The custom CA certificate could not be loaded from the Home Assistant config directory",
+      "legacy_oauth_required": "Enable legacy OAuth UserInfo mode when the scope does not include openid",
+      "invalid_provider_configuration": "Use valid HTTPS provider endpoints and asymmetric ID-token signing algorithms"
     },
     "step": {
       "advanced": {
@@ -51,11 +55,13 @@
       "discovery": {
         "data": {
           "configure_url": "Configure URL",
-          "validate_tls": "Validate TLS certificate"
+          "validate_tls": "Validate TLS certificate",
+          "ca_cert_path": "Custom CA certificate path"
         },
         "data_description": {
           "configure_url": "Discovery endpoint, usually the provider's OpenID configuration URL",
-          "validate_tls": "Verify the provider TLS certificate when fetching the discovery document"
+          "validate_tls": "Verify the provider TLS certificate when fetching the discovery document",
+          "ca_cert_path": "Optional PEM CA bundle inside the Home Assistant config directory, for example certs/private-ca.pem"
         },
         "description": "Enter the configure URL to discover the provider endpoints automatically."
       },
@@ -80,7 +86,8 @@
           "validate_tls": "Validate TLS certificate",
           "issuer": "Issuer",
           "jwks_url": "JWKS endpoint",
-          "id_token_signing_algorithms_input": "ID token signing algorithms"
+          "id_token_signing_algorithms_input": "ID token signing algorithms",
+          "ca_cert_path": "Custom CA certificate path"
         },
         "data_description": {
           "authorize_url": "Authorization endpoint",
@@ -91,7 +98,8 @@
           "validate_tls": "Verify the provider TLS certificate for discovery, token, and user info requests",
           "issuer": "OIDC issuer identifier; required for manual OpenID configuration",
           "jwks_url": "JWKS endpoint used to validate ID token signatures",
-          "id_token_signing_algorithms_input": "Comma-separated allowed algorithms, for example RS256 or ES256"
+          "id_token_signing_algorithms_input": "Comma-separated allowed algorithms, for example RS256 or ES256",
+          "ca_cert_path": "Optional PEM CA bundle inside the Home Assistant config directory, for example certs/private-ca.pem"
         },
         "description": "{pkce_message}"
       },

@@ -41,6 +41,12 @@ describe("authentication frontend", () => {
     expect(dom.window.sessionStorage.getItem("openidAlertMessage")).toBe("failed");
   });
 
+  it("requires an explicit enabled logout probe response", () => {
+    const source = read("logout.js");
+    expect(source).toContain("response.status === 204");
+    expect(source).toContain("payload?.enabled === true");
+  });
+
   it("uses external scripts in authentication templates", () => {
     for (const template of ["android_waiting_template.html", "error_template.html"]) {
       const dom = new JSDOM(read(template));

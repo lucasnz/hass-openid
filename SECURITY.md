@@ -40,5 +40,7 @@ The endpoint requires a signed logout token and rejects token replay.
 This integration patches private Home Assistant authentication routes because
 Home Assistant does not currently expose a public extension API for this flow.
 Runtime patches are installed transactionally and restored only when their target
-has not been replaced by another component. CI tests both the pinned Home
-Assistant test helper and the current helper release.
+has not been replaced by another component. Unloading or reloading the config
+entry revokes OpenID-backed Home Assistant refresh tokens before removing the
+provider, so users must authenticate again after a reconfiguration. CI tests both
+the pinned Home Assistant test helper and the current helper release.

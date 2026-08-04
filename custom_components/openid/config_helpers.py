@@ -10,10 +10,14 @@ from homeassistant.core import HomeAssistant
 
 from .const import (
     CONF_AUTHORIZE_URL,
+    CONF_CA_CERT_PATH,
+    CONF_CONFIGURE_URL,
+    CONF_ERROR_URL,
     CONF_ID_TOKEN_SIGNING_ALGORITHMS,
     CONF_ISSUER,
     CONF_JWKS_URL,
     CONF_LOGOUT_URL,
+    CONF_POST_LOGOUT_URL,
     CONF_TOKEN_URL,
     CONF_TRUSTED_IPS,
     CONF_USER_INFO_URL,
@@ -25,7 +29,9 @@ from .const import (
 )
 from .network import (
     MAX_DISCOVERY_BYTES,
+    async_get_ssl_parameter,
     async_request_json_object,
+    validate_issuer_url,
     validate_provider_url,
 )
 
@@ -84,18 +90,30 @@ def validate_runtime_provider_urls(config: dict[str, Any]) -> None:
     """Validate every configured provider endpoint before activating it."""
     for key in (
         CONF_AUTHORIZE_URL,
+        CONF_CONFIGURE_URL,
+        CONF_ERROR_URL,
         CONF_TOKEN_URL,
         CONF_USER_INFO_URL,
         CONF_JWKS_URL,
         CONF_LOGOUT_URL,
+        CONF_POST_LOGOUT_URL,
     ):
         if value := config.get(key):
             config[key] = validate_provider_url(value, field=key)
 
     if issuer := config.get(CONF_ISSUER):
-        config[CONF_ISSUER] = validate_provider_url(issuer, field=CONF_ISSUER).rstrip(
-            "/"
-        )
+        config[CONF_ISSUER] = validate_issuer_url(issuer)
+
+
+async def async_validate_tls_configuration(
+    hass: HomeAssistant, config: dict[str, Any]
+) -> None:
+    """Validate and cache an optional provider CA certificate bundle."""
+    await async_get_ssl_parameter(
+        hass,
+        validate_tls=bool(config.get(CONF_VALIDATE_TLS, DEFAULT_VALIDATE_TLS)),
+        ca_cert_path=config.get(CONF_CA_CERT_PATH),
+    )
 
 
 async def async_discover_configuration(
@@ -103,6 +121,7 @@ async def async_discover_configuration(
     configure_url: str,
     validate_tls: bool = DEFAULT_VALIDATE_TLS,
     expected_issuer: str | None = None,
+    ca_cert_path: str | None = None,
 ) -> dict[str, Any]:
     """Fetch and strictly validate an OpenID discovery document."""
     configure_url = validate_provider_url(
@@ -116,13 +135,14 @@ async def async_discover_configuration(
         validate_tls=validate_tls,
         endpoint_name="OpenID discovery endpoint",
         max_bytes=MAX_DISCOVERY_BYTES,
+        ca_cert_path=ca_cert_path,
     )
 
     issuer = config_data.get("issuer")
     if not isinstance(issuer, str):
         raise ValueError("OpenID discovery metadata is missing a string issuer")
-    issuer = validate_provider_url(issuer, field="issuer").rstrip("/")
-    if expected_issuer and issuer != expected_issuer.rstrip("/"):
+    issuer = validate_issuer_url(issuer)
+    if expected_issuer and issuer != validate_issuer_url(expected_issuer):
         raise ValueError("OpenID discovery issuer changed unexpectedly")
 
     endpoint_mapping = {
@@ -150,6 +170,15 @@ async def async_discover_configuration(
         or not all(isinstance(value, str) and value for value in algorithms)
     ):
         raise ValueError("Invalid ID token signing algorithm metadata")
+    algorithms = [
+        value
+        for value in algorithms
+        if value != "none" and not value.startswith("HS")
+    ]
+    if not algorithms:
+        raise ValueError(
+            "Provider does not advertise an asymmetric ID token algorithm"
+        )
     result[CONF_ID_TOKEN_SIGNING_ALGORITHMS] = algorithms
 
     pkce_methods = config_data.get("code_challenge_methods_supported", [])

@@ -10,7 +10,7 @@ from urllib.parse import quote_plus
 from homeassistant.core import HomeAssistant
 
 from .config_helpers import get_active_config
-from .const import CONF_VALIDATE_TLS, DEFAULT_VALIDATE_TLS
+from .const import CONF_CA_CERT_PATH, CONF_VALIDATE_TLS, DEFAULT_VALIDATE_TLS
 from .network import (
     MAX_TOKEN_BYTES,
     MAX_USERINFO_BYTES,
@@ -31,11 +31,13 @@ async def exchange_code_for_token(
     validate_tls: bool | None = None,
     use_header_auth: bool = True,
     code_verifier: str | None = None,
+    ca_cert_path: str | None = None,
 ) -> dict[str, Any]:
     """Exchange the authorisation code for tokens at the IdP."""
+    config = get_active_config(hass) or {}
     if validate_tls is None:
-        config = get_active_config(hass) or {}
         validate_tls = bool(config.get(CONF_VALIDATE_TLS, DEFAULT_VALIDATE_TLS))
+    ca_cert_path = ca_cert_path or config.get(CONF_CA_CERT_PATH)
 
     data = {
         "grant_type": "authorization_code",
@@ -56,7 +58,8 @@ async def exchange_code_for_token(
         headers["Authorization"] = f"Basic {encoded_credentials}"
     else:
         _LOGGER.warning(
-            "Sending the OpenID client secret in the token request body; ensure provider request logging is protected"
+            "Sending the OpenID client secret in the token request body; "
+            "ensure provider request logging is protected"
         )
         data["client_id"] = client_id
         data["client_secret"] = client_secret
@@ -71,6 +74,7 @@ async def exchange_code_for_token(
         max_bytes=MAX_TOKEN_BYTES,
         headers=headers,
         data=data,
+        ca_cert_path=ca_cert_path,
     )
 
 
@@ -79,11 +83,13 @@ async def fetch_user_info(
     user_info_url: str,
     access_token: str,
     validate_tls: bool | None = None,
+    ca_cert_path: str | None = None,
 ) -> dict[str, Any]:
     """Fetch user information from the UserInfo endpoint."""
+    config = get_active_config(hass) or {}
     if validate_tls is None:
-        config = get_active_config(hass) or {}
         validate_tls = bool(config.get(CONF_VALIDATE_TLS, DEFAULT_VALIDATE_TLS))
+    ca_cert_path = ca_cert_path or config.get(CONF_CA_CERT_PATH)
 
     return await async_request_json_object(
         hass,
@@ -93,4 +99,5 @@ async def fetch_user_info(
         endpoint_name="UserInfo endpoint",
         max_bytes=MAX_USERINFO_BYTES,
         headers={"Authorization": f"Bearer {access_token}"},
+        ca_cert_path=ca_cert_path,
     )

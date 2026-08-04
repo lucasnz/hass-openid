@@ -66,9 +66,42 @@ def override_authorize_login_flow(hass: HomeAssistant) -> Callable[[], None] | N
             should_block = config.get(CONF_BLOCK_LOGIN, False) and not _is_trusted_request(
                 request, config
             )
+            response_status = HTTPStatus.OK
+            response_headers: dict[str, str] = {}
             if not should_block:
                 original = await original_handler(request)
-                content = json.loads(original.text)
+                if not isinstance(original, Response) or not isinstance(
+                    original.text, str
+                ):
+                    _LOGGER.warning(
+                        "Home Assistant /auth/login_flow returned an unsupported "
+                        "response type; leaving it unchanged"
+                    )
+                    return original
+                try:
+                    content = json.loads(original.text)
+                except (TypeError, json.JSONDecodeError):
+                    _LOGGER.warning(
+                        "Home Assistant /auth/login_flow returned invalid JSON; "
+                        "leaving it unchanged"
+                    )
+                    return original
+                if not isinstance(content, dict):
+                    _LOGGER.warning(
+                        "Home Assistant /auth/login_flow returned a non-object "
+                        "JSON response; leaving it unchanged"
+                    )
+                    return original
+                response_status = original.status
+                response_headers = dict(original.headers)
+                for header in (
+                    "Content-Length",
+                    "Content-Encoding",
+                    "Content-Type",
+                    "ETag",
+                    "Last-Modified",
+                ):
+                    response_headers.pop(header, None)
             else:
                 content = {
                     "type": "form",
@@ -86,11 +119,12 @@ def override_authorize_login_flow(hass: HomeAssistant) -> Callable[[], None] | N
             content[CONF_OPENID_TEXT] = config.get(
                 CONF_OPENID_TEXT, "OpenID / OAuth2 Authentication"
             )
+            response_headers.update(NO_STORE_HEADERS)
             return Response(
-                status=HTTPStatus.OK,
+                status=response_status,
                 text=json.dumps(content, separators=(",", ":")),
                 content_type="application/json",
-                headers=NO_STORE_HEADERS,
+                headers=response_headers,
             )
 
         post_handler._handler = post  # noqa: SLF001
@@ -102,7 +136,8 @@ def override_authorize_login_flow(hass: HomeAssistant) -> Callable[[], None] | N
                 _LOGGER.debug("Restored /auth/login_flow route")
             else:
                 _LOGGER.warning(
-                    "/auth/login_flow changed after OpenID setup; leaving the newer handler in place"
+                    "/auth/login_flow changed after OpenID setup; leaving the "
+                    "newer handler in place"
                 )
 
         return restore
@@ -141,6 +176,13 @@ def override_authorize_route(hass: HomeAssistant) -> Callable[[], None] | None:
                             '<script src="/openid/authorize.js"></script></body>',
                         )
                         headers = dict(response.headers)
+                        for header in (
+                            "Content-Length",
+                            "Content-Encoding",
+                            "ETag",
+                            "Last-Modified",
+                        ):
+                            headers.pop(header, None)
                         headers.update(NO_STORE_HEADERS)
                         return Response(
                             text=text,

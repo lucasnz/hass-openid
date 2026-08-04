@@ -13,21 +13,34 @@ const waitForHass = async () => {
   return null;
 };
 
-const loadLogoutPath = async (hass) => {
+const authenticatedFetch = async (hass, url) => {
+  if (hass?.fetchWithAuth) return hass.fetchWithAuth(url);
+  const token = hass?.auth?.accessToken || hass?.auth?.data?.access_token;
+  if (!token) return null;
+  return fetch(url, {
+    headers: { Authorization: `Bearer ${token}` },
+    cache: "no-store",
+  });
+};
+
+const providerLogoutEnabled = async (hass) => {
   try {
-    let response;
-    if (hass?.fetchWithAuth) {
-      response = await hass.fetchWithAuth(LOGOUT_SESSION_ENDPOINT);
-    } else {
-      const token = hass?.auth?.accessToken || hass?.auth?.data?.access_token;
-      if (!token) return null;
-      response = await fetch(LOGOUT_SESSION_ENDPOINT, {
-        headers: { Authorization: `Bearer ${token}` },
-        cache: "no-store",
-      });
-    }
-    if (response.status === 204) return null;
-    if (!response.ok) throw new Error(`session endpoint returned ${response.status}`);
+    const response = await authenticatedFetch(
+      hass,
+      `${LOGOUT_SESSION_ENDPOINT}?probe=1`,
+    );
+    if (!response?.ok || response.status === 204) return false;
+    const payload = await response.json();
+    return payload?.enabled === true;
+  } catch (_err) {
+    return false;
+  }
+};
+
+const createLogoutTicket = async (hass) => {
+  try {
+    const response = await authenticatedFetch(hass, LOGOUT_SESSION_ENDPOINT);
+    if (!response?.ok) return null;
     const payload = await response.json();
     return typeof payload?.logout_path === "string" ? payload.logout_path : null;
   } catch (err) {
@@ -36,7 +49,7 @@ const loadLogoutPath = async (hass) => {
   }
 };
 
-const performLogout = async (hass, logoutPath) => {
+const revokeHomeAssistantSession = async (hass) => {
   try {
     await hass.auth.revoke();
   } catch (err) {
@@ -47,14 +60,11 @@ const performLogout = async (hass, logoutPath) => {
   } catch (err) {
     console.warn("hass-openid: connection close failed", err);
   }
-  window.location.assign(logoutPath);
 };
 
 const initializeLogoutOverride = async () => {
   const hass = await waitForHass();
-  if (!hass) return;
-  const logoutPath = await loadLogoutPath(hass);
-  if (!logoutPath) return;
+  if (!hass || !(await providerLogoutEnabled(hass))) return;
 
   window.addEventListener(
     "hass-logout",
@@ -64,7 +74,10 @@ const initializeLogoutOverride = async () => {
       if (handlingLogout) return;
       handlingLogout = true;
       try {
-        await performLogout(findHass() || hass, logoutPath);
+        const activeHass = findHass() || hass;
+        const logoutPath = await createLogoutTicket(activeHass);
+        await revokeHomeAssistantSession(activeHass);
+        window.location.assign(logoutPath || "/");
       } finally {
         handlingLogout = false;
       }

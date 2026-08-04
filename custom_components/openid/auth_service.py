@@ -5,10 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from aiohttp import ClientError
+from jwt.exceptions import PyJWTError
+
 from homeassistant.const import CONF_CLIENT_ID, CONF_CLIENT_SECRET
 from homeassistant.core import HomeAssistant
 
 from .const import (
+    CONF_CA_CERT_PATH,
     CONF_ID_TOKEN_SIGNING_ALGORITHMS,
     CONF_ISSUER,
     CONF_JWKS_URL,
@@ -23,6 +27,7 @@ from .const import (
     CRED_SUBJECT,
 )
 from .identity import normalize_username
+from .network import ProviderResponseError
 from .oauth_helper import exchange_code_for_token, fetch_user_info
 from .oidc_helper import async_validate_id_token
 
@@ -33,6 +38,17 @@ class ProviderAuthenticationError(RuntimeError):
     def __init__(self, public_message: str, *, reason: str) -> None:
         super().__init__(reason)
         self.public_message = public_message
+
+
+def _optional_claim_string(user_info: Mapping[str, Any], key: str) -> str | None:
+    """Return a stripped optional string claim, rejecting malformed values."""
+    value = user_info.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"UserInfo {key} claim must be a string")
+    value = value.strip()
+    return value or None
 
 
 @dataclass(slots=True)
@@ -66,6 +82,7 @@ async def async_exchange_and_validate_identity(
             validate_tls=bool(config.get(CONF_VALIDATE_TLS, True)),
             use_header_auth=bool(config.get(CONF_USE_HEADER_AUTH, True)),
             code_verifier=code_verifier,
+            ca_cert_path=config.get(CONF_CA_CERT_PATH),
         )
 
         id_token_claims: dict[str, Any] | None = None
@@ -90,6 +107,7 @@ async def async_exchange_and_validate_identity(
                 nonce=nonce,
                 algorithms=list(algorithms),
                 validate_tls=bool(config.get(CONF_VALIDATE_TLS, True)),
+                ca_cert_path=config.get(CONF_CA_CERT_PATH),
             )
 
         access_token = token_data.get("access_token")
@@ -100,6 +118,7 @@ async def async_exchange_and_validate_identity(
             user_info_url=config[CONF_USER_INFO_URL],
             access_token=access_token,
             validate_tls=bool(config.get(CONF_VALIDATE_TLS, True)),
+            ca_cert_path=config.get(CONF_CA_CERT_PATH),
         )
 
         if id_token_claims is not None:
@@ -114,19 +133,25 @@ async def async_exchange_and_validate_identity(
 
         username_field = config[CONF_USERNAME_FIELD]
         username = normalize_username(user_info.get(username_field))
-        if username_field == "email" and user_info.get("email_verified") is False:
+        if (
+            username_field == "email"
+            and "email_verified" in user_info
+            and user_info["email_verified"] is not True
+        ):
             raise ValueError("The provider has not verified the email address")
 
-        credential_fields = {
-            key: value
-            for key, value in (
-                ("username", username),
-                ("name", user_info.get("name") or user_info.get("preferred_username")),
-                ("email", user_info.get("email")),
-                ("preferred_username", user_info.get("preferred_username")),
-            )
-            if value
-        }
+        name = _optional_claim_string(user_info, "name")
+        preferred_username = _optional_claim_string(
+            user_info, "preferred_username"
+        )
+        email = _optional_claim_string(user_info, "email")
+        credential_fields: dict[str, Any] = {"username": username}
+        if name or preferred_username:
+            credential_fields["name"] = name or preferred_username
+        if email:
+            credential_fields["email"] = email
+        if preferred_username:
+            credential_fields["preferred_username"] = preferred_username
         if id_token_claims is not None:
             credential_fields[CRED_ISSUER] = id_token_claims["iss"]
             credential_fields[CRED_SUBJECT] = id_token_claims["sub"]
@@ -141,7 +166,16 @@ async def async_exchange_and_validate_identity(
         )
     except ProviderAuthenticationError:
         raise
-    except Exception as err:
+    except (
+        ClientError,
+        KeyError,
+        LookupError,
+        ProviderResponseError,
+        PyJWTError,
+        TimeoutError,
+        TypeError,
+        ValueError,
+    ) as err:
         raise ProviderAuthenticationError(
             "OpenID login failed! The provider response could not be validated.",
             reason=str(err),

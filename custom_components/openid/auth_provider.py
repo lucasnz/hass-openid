@@ -27,6 +27,7 @@ from .const import CRED_ISSUER, CRED_SUBJECT, DOMAIN
 from .identity import normalize_username
 
 OPENID_AUTH_PROVIDER_SCHEMA = AUTH_PROVIDER_SCHEMA.extend({}, extra=vol.ALLOW_EXTRA)
+_LEGACY_CRED_SUBJECT = "subject"
 
 
 class OpenIDIdentityConflictError(ValueError):
@@ -100,7 +101,8 @@ class OpenIDAuthProvider(AuthProvider):
             )
         if stable_matches:
             credentials = stable_matches[0]
-            credentials.data.update(credential_data)
+            # Defer all credential mutation until Home Assistant has resolved
+            # and linked the user. AuthStore owns persisted object mutation.
             credentials.is_new = False
             return credentials
 
@@ -123,21 +125,38 @@ class OpenIDAuthProvider(AuthProvider):
             credentials = username_matches[0]
             stored_issuer = credentials.data.get(CRED_ISSUER)
             stored_subject = credentials.data.get(CRED_SUBJECT)
+            legacy_subject = credentials.data.get(_LEGACY_CRED_SUBJECT)
 
             # Permit a one-time migration of credentials created before stable
-            # identity binding was introduced. Never rebind an already-bound
-            # username to a different issuer or subject.
+            # issuer binding was introduced. The old integration did persist
+            # ``subject``; require that value to match before binding an issuer.
             if stored_issuer or stored_subject:
                 if not issuer or not subject:
                     raise OpenIDIdentityConflictError(
-                        "The username is bound to an OIDC identity and cannot be used by an unverified OAuth identity"
+                        "The username is bound to an OIDC identity and cannot "
+                        "be used by an unverified OAuth identity"
                     )
                 if stored_issuer != issuer or stored_subject != subject:
                     raise OpenIDIdentityConflictError(
                         "The username is already bound to another OIDC identity"
                     )
+            elif legacy_subject is not None:
+                if not isinstance(legacy_subject, str) or not legacy_subject:
+                    raise OpenIDIdentityConflictError(
+                        "The username has invalid legacy OIDC identity metadata"
+                    )
+                if not issuer or not subject:
+                    raise OpenIDIdentityConflictError(
+                        "The username is bound to an OIDC identity and cannot "
+                        "be used by an unverified OAuth identity"
+                    )
+                if legacy_subject != subject:
+                    raise OpenIDIdentityConflictError(
+                        "The username is already bound to another OIDC subject"
+                    )
 
-            credentials.data.update(credential_data)
+            # Defer all credential mutation until Home Assistant has resolved
+            # and linked the user. AuthStore owns persisted object mutation.
             credentials.is_new = False
             return credentials
 

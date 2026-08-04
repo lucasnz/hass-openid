@@ -25,10 +25,16 @@ from homeassistant.helpers.selector import (
 )
 
 from .config_helpers import async_discover_configuration
+from .network import (
+    async_get_ssl_parameter,
+    validate_issuer_url,
+    validate_provider_url,
+)
 from .const import (
     CONF_ALLOW_LEGACY_OAUTH,
     CONF_AUTHORIZE_URL,
     CONF_BLOCK_LOGIN,
+    CONF_CA_CERT_PATH,
     CONF_CONFIGURE_URL,
     CONF_CREATE_USER,
     CONF_ERROR_URL,
@@ -150,65 +156,87 @@ class OpenIDConfigFlow(ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             self._manual_mode = False
-            validate_tls = bool(user_input.get(CONF_VALIDATE_TLS, DEFAULT_VALIDATE_TLS))
-            try:
-                discovered = await async_discover_configuration(
-                    self.hass,
-                    user_input[CONF_CONFIGURE_URL],
-                    validate_tls=validate_tls,
-                )
-            except Exception as err:
-                if validate_tls and isinstance(err, TLS_DISCOVERY_EXCEPTIONS):
-                    _LOGGER.warning(
-                        "OpenID discovery failed because TLS validation failed: %s",
-                        err,
-                    )
-                    errors["base"] = "invalid_ssl_certificate"
-                else:
-                    _LOGGER.exception("OpenID discovery failed")
-                    errors["base"] = "cannot_connect"
+            validate_tls = bool(
+                user_input.get(CONF_VALIDATE_TLS, DEFAULT_VALIDATE_TLS)
+            )
+            ca_cert_path = user_input.get(CONF_CA_CERT_PATH, "").strip()
+            if ca_cert_path and not validate_tls:
+                errors["base"] = "invalid_tls_configuration"
             else:
-                if not all(
-                    discovered.get(key)
-                    for key in (
-                        CONF_AUTHORIZE_URL,
-                        CONF_TOKEN_URL,
-                        CONF_USER_INFO_URL,
-                        CONF_ISSUER,
-                        CONF_JWKS_URL,
+                try:
+                    discovered = await async_discover_configuration(
+                        self.hass,
+                        user_input[CONF_CONFIGURE_URL],
+                        validate_tls=validate_tls,
+                        ca_cert_path=ca_cert_path or None,
                     )
-                ):
-                    errors["base"] = "invalid_discovery"
-                else:
-                    self._config_data.update(
-                        {
-                            CONF_CONFIGURE_URL: user_input[CONF_CONFIGURE_URL],
-                            CONF_VALIDATE_TLS: validate_tls,
-                            CONF_AUTHORIZE_URL: discovered[CONF_AUTHORIZE_URL],
-                            CONF_TOKEN_URL: discovered[CONF_TOKEN_URL],
-                            CONF_USER_INFO_URL: discovered[CONF_USER_INFO_URL],
-                            CONF_ISSUER: discovered[CONF_ISSUER],
-                            CONF_JWKS_URL: discovered[CONF_JWKS_URL],
-                            CONF_ID_TOKEN_SIGNING_ALGORITHMS: discovered.get(
-                                CONF_ID_TOKEN_SIGNING_ALGORITHMS, ["RS256"]
-                            ),
-                        }
-                    )
-                    if discovered.get(CONF_LOGOUT_URL):
-                        self._config_data[CONF_LOGOUT_URL] = discovered[CONF_LOGOUT_URL]
+                except Exception as err:
+                    if validate_tls and isinstance(
+                        err, TLS_DISCOVERY_EXCEPTIONS
+                    ):
+                        _LOGGER.warning(
+                            "OpenID discovery failed because TLS validation "
+                            "failed: %s",
+                            err,
+                        )
+                        errors["base"] = "invalid_ssl_certificate"
                     else:
-                        self._config_data.pop(CONF_LOGOUT_URL, None)
+                        _LOGGER.exception("OpenID discovery failed")
+                        errors["base"] = "cannot_connect"
+                else:
+                    if not all(
+                        discovered.get(key)
+                        for key in (
+                            CONF_AUTHORIZE_URL,
+                            CONF_TOKEN_URL,
+                            CONF_USER_INFO_URL,
+                            CONF_ISSUER,
+                            CONF_JWKS_URL,
+                        )
+                    ):
+                        errors["base"] = "invalid_discovery"
+                    else:
+                        self._config_data.update(
+                            {
+                                CONF_CONFIGURE_URL: user_input[
+                                    CONF_CONFIGURE_URL
+                                ],
+                                CONF_VALIDATE_TLS: validate_tls,
+                                CONF_CA_CERT_PATH: ca_cert_path,
+                                CONF_AUTHORIZE_URL: discovered[
+                                    CONF_AUTHORIZE_URL
+                                ],
+                                CONF_TOKEN_URL: discovered[CONF_TOKEN_URL],
+                                CONF_USER_INFO_URL: discovered[
+                                    CONF_USER_INFO_URL
+                                ],
+                                CONF_ISSUER: discovered[CONF_ISSUER],
+                                CONF_JWKS_URL: discovered[CONF_JWKS_URL],
+                                CONF_ID_TOKEN_SIGNING_ALGORITHMS: discovered.get(
+                                    CONF_ID_TOKEN_SIGNING_ALGORITHMS, ["RS256"]
+                                ),
+                            }
+                        )
+                        if discovered.get(CONF_LOGOUT_URL):
+                            self._config_data[CONF_LOGOUT_URL] = discovered[
+                                CONF_LOGOUT_URL
+                            ]
+                        else:
+                            self._config_data.pop(CONF_LOGOUT_URL, None)
 
-                    self._pkce_availability_known = True
-                    self._pkce_available = bool(discovered[DISCOVERY_PKCE_AVAILABLE])
-                    self._config_data[CONF_USE_PKCE] = self._pkce_available
-                    return await self.async_step_provider()
+                        self._pkce_availability_known = True
+                        self._pkce_available = bool(
+                            discovered[DISCOVERY_PKCE_AVAILABLE]
+                        )
+                        self._config_data[CONF_USE_PKCE] = self._pkce_available
+                        return await self.async_step_provider()
 
         suggested_values = user_input or {
             CONF_CONFIGURE_URL: self._config_data.get(CONF_CONFIGURE_URL, ""),
             CONF_VALIDATE_TLS: self._config_data.get(
                 CONF_VALIDATE_TLS, DEFAULT_VALIDATE_TLS
             ),
+            CONF_CA_CERT_PATH: self._config_data.get(CONF_CA_CERT_PATH, ""),
         }
 
         return self.async_show_form(
@@ -218,6 +246,7 @@ class OpenIDConfigFlow(ConfigFlow, domain=DOMAIN):
                     {
                         vol.Required(CONF_CONFIGURE_URL): _url_selector(),
                         vol.Required(CONF_VALIDATE_TLS): BooleanSelector(),
+                        vol.Optional(CONF_CA_CERT_PATH): _text_selector(),
                     }
                 ),
                 suggested_values,
@@ -288,6 +317,61 @@ class OpenIDConfigFlow(ConfigFlow, domain=DOMAIN):
                 for field in required_fields
                 if not str(user_input.get(field, "")).strip()
             ]
+            ca_cert_path = user_input.get(CONF_CA_CERT_PATH, "").strip()
+            validate_tls = bool(
+                user_input.get(CONF_VALIDATE_TLS, DEFAULT_VALIDATE_TLS)
+            )
+            if ca_cert_path and not validate_tls:
+                errors["base"] = "invalid_tls_configuration"
+            elif ca_cert_path:
+                try:
+                    await async_get_ssl_parameter(
+                        self.hass,
+                        validate_tls=True,
+                        ca_cert_path=ca_cert_path,
+                    )
+                except ValueError:
+                    errors["base"] = "invalid_ca_certificate"
+
+            if not errors and not missing_fields:
+                try:
+                    for field in (
+                        CONF_AUTHORIZE_URL,
+                        CONF_TOKEN_URL,
+                        CONF_USER_INFO_URL,
+                    ):
+                        user_input[field] = validate_provider_url(
+                            user_input[field], field=field
+                        )
+                    if logout_url := user_input.get(CONF_LOGOUT_URL, "").strip():
+                        user_input[CONF_LOGOUT_URL] = validate_provider_url(
+                            logout_url, field=CONF_LOGOUT_URL
+                        )
+                    if self._manual_mode and openid_requested:
+                        user_input[CONF_ISSUER] = validate_issuer_url(
+                            user_input[CONF_ISSUER]
+                        )
+                        user_input[CONF_JWKS_URL] = validate_provider_url(
+                            user_input[CONF_JWKS_URL], field=CONF_JWKS_URL
+                        )
+                    algorithms_input = user_input.get(
+                        CONF_ID_TOKEN_SIGNING_ALGORITHMS_INPUT, ""
+                    )
+                    algorithms = [
+                        value
+                        for chunk in algorithms_input.split(",")
+                        if (value := chunk.strip())
+                    ]
+                    if any(
+                        value == "none" or value.startswith("HS")
+                        for value in algorithms
+                    ):
+                        raise ValueError(
+                            "Only asymmetric ID-token signing algorithms are allowed"
+                        )
+                except ValueError:
+                    errors["base"] = "invalid_provider_configuration"
+
             if missing_fields:
                 errors["base"] = (
                     "missing_oidc_metadata"
@@ -299,15 +383,14 @@ class OpenIDConfigFlow(ConfigFlow, domain=DOMAIN):
                     )
                     else "required_fields"
                 )
-            else:
+            elif not errors:
                 self._config_data.update(
                     {
                         CONF_AUTHORIZE_URL: user_input[CONF_AUTHORIZE_URL].strip(),
                         CONF_TOKEN_URL: user_input[CONF_TOKEN_URL].strip(),
                         CONF_USER_INFO_URL: user_input[CONF_USER_INFO_URL].strip(),
-                        CONF_VALIDATE_TLS: bool(
-                            user_input.get(CONF_VALIDATE_TLS, DEFAULT_VALIDATE_TLS)
-                        ),
+                        CONF_VALIDATE_TLS: validate_tls,
+                        CONF_CA_CERT_PATH: ca_cert_path,
                     }
                 )
 
@@ -344,7 +427,9 @@ class OpenIDConfigFlow(ConfigFlow, domain=DOMAIN):
                             algorithms or ["RS256"]
                         )
                     elif algorithms:
-                        self._config_data[CONF_ID_TOKEN_SIGNING_ALGORITHMS] = algorithms
+                        self._config_data[CONF_ID_TOKEN_SIGNING_ALGORITHMS] = (
+                            algorithms
+                        )
                     else:
                         self._config_data.pop(
                             CONF_ID_TOKEN_SIGNING_ALGORITHMS, None
@@ -353,7 +438,8 @@ class OpenIDConfigFlow(ConfigFlow, domain=DOMAIN):
                 self._config_data[CONF_USE_PKCE] = bool(
                     user_input.get(CONF_USE_PKCE, False)
                     if not self._pkce_availability_known
-                    else self._pkce_available and user_input.get(CONF_USE_PKCE, False)
+                    else self._pkce_available
+                    and user_input.get(CONF_USE_PKCE, False)
                 )
                 return await self.async_step_credentials()
 
@@ -371,6 +457,7 @@ class OpenIDConfigFlow(ConfigFlow, domain=DOMAIN):
             CONF_VALIDATE_TLS: self._config_data.get(
                 CONF_VALIDATE_TLS, DEFAULT_VALIDATE_TLS
             ),
+            CONF_CA_CERT_PATH: self._config_data.get(CONF_CA_CERT_PATH, ""),
             CONF_USE_PKCE: self._config_data.get(CONF_USE_PKCE, False),
         }
         if self._manual_mode and user_input is None:
@@ -391,11 +478,13 @@ class OpenIDConfigFlow(ConfigFlow, domain=DOMAIN):
             )
         elif self._pkce_available:
             pkce_message = (
-                "PKCE (S256) is available for this provider. You can disable it if needed."
+                "PKCE (S256) is available for this provider. "
+                "You can disable it if needed."
             )
         else:
             pkce_message = (
-                "PKCE (S256) is not advertised by this provider, so it cannot be enabled."
+                "PKCE (S256) is not advertised by this provider, "
+                "so it cannot be enabled."
             )
 
         schema: dict[Any, Any] = {
@@ -418,6 +507,7 @@ class OpenIDConfigFlow(ConfigFlow, domain=DOMAIN):
         schema.update(
             {
                 vol.Required(CONF_VALIDATE_TLS): BooleanSelector(),
+                vol.Optional(CONF_CA_CERT_PATH): _text_selector(),
                 vol.Required(CONF_USE_PKCE): BooleanSelector(
                     BooleanSelectorConfig(
                         read_only=(
@@ -514,16 +604,39 @@ class OpenIDConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         if user_input is not None:
+            legacy_oauth_enabled = bool(user_input[CONF_ALLOW_LEGACY_OAUTH])
+            if (
+                "openid" not in self._config_data.get(CONF_SCOPE, DEFAULT_SCOPE).split()
+                and not legacy_oauth_enabled
+            ):
+                errors[CONF_ALLOW_LEGACY_OAUTH] = "legacy_oauth_required"
+
             try:
-                trusted_ips = _parse_trusted_ips(user_input.get(CONF_TRUSTED_IPS_INPUT))
+                trusted_ips = _parse_trusted_ips(
+                    user_input.get(CONF_TRUSTED_IPS_INPUT)
+                )
             except ValueError:
                 errors[CONF_TRUSTED_IPS_INPUT] = "invalid_cidr"
-            else:
+
+            error_url = user_input.get(CONF_ERROR_URL, "").strip()
+            post_logout_url = user_input.get(CONF_POST_LOGOUT_URL, "").strip()
+            if not errors:
+                try:
+                    if error_url:
+                        error_url = validate_provider_url(
+                            error_url, field=CONF_ERROR_URL
+                        )
+                    if post_logout_url:
+                        post_logout_url = validate_provider_url(
+                            post_logout_url, field=CONF_POST_LOGOUT_URL
+                        )
+                except ValueError:
+                    errors["base"] = "invalid_provider_configuration"
+
+            if not errors:
                 self._config_data.update(
                     {
-                        CONF_ALLOW_LEGACY_OAUTH: user_input[
-                            CONF_ALLOW_LEGACY_OAUTH
-                        ],
+                        CONF_ALLOW_LEGACY_OAUTH: legacy_oauth_enabled,
                         CONF_BLOCK_LOGIN: user_input[CONF_BLOCK_LOGIN],
                         CONF_TRUSTED_IPS: trusted_ips,
                         CONF_OPENID_TEXT: user_input[CONF_OPENID_TEXT].strip(),
@@ -532,13 +645,11 @@ class OpenIDConfigFlow(ConfigFlow, domain=DOMAIN):
                     }
                 )
 
-                error_url = user_input.get(CONF_ERROR_URL, "").strip()
                 if error_url:
                     self._config_data[CONF_ERROR_URL] = error_url
                 else:
                     self._config_data.pop(CONF_ERROR_URL, None)
 
-                post_logout_url = user_input.get(CONF_POST_LOGOUT_URL, "").strip()
                 if post_logout_url:
                     self._config_data[CONF_POST_LOGOUT_URL] = post_logout_url
                 else:

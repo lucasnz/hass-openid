@@ -44,3 +44,45 @@ async def test_session_endpoint_never_returns_id_token(
     assert response.status == 200
     assert payload["logout_path"].startswith("/auth/openid/logout?ticket=")
     assert "sensitive-id-token" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_logout_probe_requires_openid_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Native logout remains untouched for users not authenticated by OpenID."""
+    user = SimpleNamespace(id="user-id", credentials=[])
+    hass = SimpleNamespace(data={})
+    monkeypatch.setattr(
+        views,
+        "get_active_config",
+        lambda _hass: {CONF_LOGOUT_URL: "https://idp.example/logout"},
+    )
+    request = make_mocked_request("GET", "/auth/openid/session?probe=1")
+    request[KEY_HASS_USER] = user
+
+    response = await OpenIDSessionView(hass).get(request)
+
+    assert response.status == 204
+
+
+@pytest.mark.asyncio
+async def test_logout_probe_enables_override_for_openid_user(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OpenID users may opt into provider logout without exposing tokens."""
+    credential = SimpleNamespace(auth_provider_type=DOMAIN, data={})
+    user = SimpleNamespace(id="user-id", credentials=[credential])
+    hass = SimpleNamespace(data={})
+    monkeypatch.setattr(
+        views,
+        "get_active_config",
+        lambda _hass: {CONF_LOGOUT_URL: "https://idp.example/logout"},
+    )
+    request = make_mocked_request("GET", "/auth/openid/session?probe=1")
+    request[KEY_HASS_USER] = user
+
+    response = await OpenIDSessionView(hass).get(request)
+
+    assert response.status == 200
+    assert json.loads(response.text) == {"enabled": True}

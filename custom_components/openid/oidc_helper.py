@@ -3,21 +3,55 @@
 from __future__ import annotations
 
 from functools import partial
+import re
 import secrets
 from time import monotonic
 from typing import Any
 
+from aiohttp import ClientError
 import jwt
 
 from homeassistant.core import HomeAssistant
 
 from .const import DEFAULT_VALIDATE_TLS, DOMAIN
-from .network import MAX_JWKS_BYTES, async_request_json_object
+from .network import (
+    MAX_JWKS_BYTES,
+    ProviderResponseError,
+    async_request_json_object,
+)
 
 _JWKS_CACHE_KEY = "jwks_cache"
 _JWKS_CACHE_TTL = 60 * 60
+_JWKS_CACHE_MAX_TTL = 6 * 60 * 60
 _JWKS_STALE_TTL = 24 * 60 * 60
 _CLOCK_SKEW_SECONDS = 60
+
+
+def _jwks_cache_ttl(headers: dict[str, str]) -> float | None:
+    """Return a bounded JWKS freshness lifetime from HTTP cache headers."""
+    cache_control = headers.get("cache-control", "")
+    directives = {
+        directive.strip().casefold()
+        for directive in cache_control.split(",")
+        if directive.strip()
+    }
+    if "no-store" in directives:
+        return None
+    if "no-cache" in directives:
+        return 0
+
+    match = re.search(r"(?:^|,)\s*max-age=(\d+)", cache_control, re.I)
+    if not match:
+        return _JWKS_CACHE_TTL
+    try:
+        max_age = min(int(match.group(1)), _JWKS_CACHE_MAX_TTL)
+    except ValueError:
+        return _JWKS_CACHE_TTL
+    try:
+        age = max(0, int(headers.get("age", "0")))
+    except ValueError:
+        age = 0
+    return max(0, max_age - age)
 
 
 async def _async_fetch_jwks(
@@ -26,22 +60,24 @@ async def _async_fetch_jwks(
     issuer: str,
     jwks_url: str,
     validate_tls: bool,
+    ca_cert_path: str | None = None,
     force_refresh: bool = False,
 ) -> dict[str, Any]:
     """Return cached JWKS, refreshing it when required."""
-    cache: dict[tuple[str, str], dict[str, Any]] = hass.data.setdefault(
+    cache: dict[tuple[str, str, bool, str], dict[str, Any]] = hass.data.setdefault(
         DOMAIN, {}
     ).setdefault(_JWKS_CACHE_KEY, {})
-    cache_key = (issuer, jwks_url)
+    cache_key = (issuer, jwks_url, validate_tls, ca_cert_path or "")
     cached = cache.get(cache_key)
     now = monotonic()
     if (
         not force_refresh
         and cached
-        and now - cached.get("fetched_at", 0.0) < _JWKS_CACHE_TTL
+        and now < cached.get("expires_at", 0.0)
     ):
         return cached["value"]
 
+    response_headers: dict[str, str] = {}
     try:
         jwks_data = await async_request_json_object(
             hass,
@@ -50,16 +86,26 @@ async def _async_fetch_jwks(
             validate_tls=validate_tls,
             endpoint_name="JWKS endpoint",
             max_bytes=MAX_JWKS_BYTES,
+            ca_cert_path=ca_cert_path,
+            response_headers=response_headers,
         )
-    except Exception:
-        if cached and now - cached.get("fetched_at", 0.0) < _JWKS_STALE_TTL:
+    except (ClientError, TimeoutError, ProviderResponseError):
+        if cached and now < cached.get("stale_until", 0.0):
             return cached["value"]
         raise
 
     keys = jwks_data.get("keys")
     if not isinstance(keys, list) or not keys:
         raise ValueError("JWKS endpoint did not return signing keys")
-    cache[cache_key] = {"fetched_at": now, "value": jwks_data}
+    cache_ttl = _jwks_cache_ttl(response_headers)
+    if cache_ttl is None:
+        cache.pop(cache_key, None)
+    else:
+        cache[cache_key] = {
+            "expires_at": now + cache_ttl,
+            "stale_until": now + max(cache_ttl, _JWKS_STALE_TTL),
+            "value": jwks_data,
+        }
     return jwks_data
 
 
@@ -101,6 +147,7 @@ async def async_validate_id_token(
     nonce: str,
     algorithms: list[str],
     validate_tls: bool = DEFAULT_VALIDATE_TLS,
+    ca_cert_path: str | None = None,
 ) -> dict[str, Any]:
     """Validate an OIDC ID token and return its claims."""
     header = jwt.get_unverified_header(id_token)
@@ -122,6 +169,7 @@ async def async_validate_id_token(
         issuer=issuer,
         jwks_url=jwks_url,
         validate_tls=validate_tls,
+        ca_cert_path=ca_cert_path,
     )
     try:
         signing_key = _select_signing_key(
@@ -137,6 +185,7 @@ async def async_validate_id_token(
             issuer=issuer,
             jwks_url=jwks_url,
             validate_tls=validate_tls,
+            ca_cert_path=ca_cert_path,
             force_refresh=True,
         )
         signing_key = _select_signing_key(
@@ -180,11 +229,18 @@ async def async_validate_logout_token(
     client_id: str,
     algorithms: list[str],
     validate_tls: bool = DEFAULT_VALIDATE_TLS,
+    ca_cert_path: str | None = None,
 ) -> dict[str, Any]:
     """Validate an OIDC back-channel logout token."""
     header = jwt.get_unverified_header(logout_token)
     algorithm = header.get("alg")
     key_id = header.get("kid")
+    token_type = header.get("typ")
+    if token_type is not None and (
+        not isinstance(token_type, str)
+        or token_type.casefold() != "logout+jwt"
+    ):
+        raise ValueError("Logout token type is invalid")
     allowed_algorithms = [
         candidate
         for candidate in algorithms
@@ -198,6 +254,7 @@ async def async_validate_logout_token(
         issuer=issuer,
         jwks_url=jwks_url,
         validate_tls=validate_tls,
+        ca_cert_path=ca_cert_path,
     )
     try:
         signing_key = _select_signing_key(
@@ -209,6 +266,7 @@ async def async_validate_logout_token(
             issuer=issuer,
             jwks_url=jwks_url,
             validate_tls=validate_tls,
+            ca_cert_path=ca_cert_path,
             force_refresh=True,
         )
         signing_key = _select_signing_key(
@@ -230,7 +288,10 @@ async def async_validate_logout_token(
         raise ValueError("Logout token must not contain a nonce")
     events = claims.get("events")
     event_name = "http://schemas.openid.net/event/backchannel-logout"
-    if not isinstance(events, dict) or event_name not in events:
+    if (
+        not isinstance(events, dict)
+        or not isinstance(events.get(event_name), dict)
+    ):
         raise ValueError("Logout token is missing the back-channel logout event")
     if not isinstance(claims.get("sub"), str) and not isinstance(
         claims.get("sid"), str

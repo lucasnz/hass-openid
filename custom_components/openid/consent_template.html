@@ -17,13 +17,8 @@
       </div>
 
       <div class="warning">Only authorize applications you trust. Make sure you recognize the application URL above.</div>
-
       <form method="post" action="/auth/openid/consent">
         <input type="hidden" name="state" value="$state" />
-        <input type="hidden" name="client_id" value="$client_id" />
-        <input type="hidden" name="redirect_uri" value="$redirect_uri" />
-        <input type="hidden" name="base_url" value="$base_url" />
-        <input type="hidden" name="client_state" value="$client_state" />
         <div class="actions">
           <a class="btn-cancel" href="$cancel_url">Cancel</a>
           <button type="submit" class="btn-authorize">Authorize</button>

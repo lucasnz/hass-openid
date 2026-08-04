@@ -15,14 +15,22 @@ from custom_components.openid.config_flow import (
 from custom_components.openid.const import (
     CONF_ALLOW_LEGACY_OAUTH,
     CONF_AUTHORIZE_URL,
+    CONF_BLOCK_LOGIN,
+    CONF_CA_CERT_PATH,
     CONF_CONFIGURE_URL,
+    CONF_CREATE_USER,
+    CONF_ERROR_URL,
     CONF_ID_TOKEN_SIGNING_ALGORITHMS,
     CONF_ISSUER,
     CONF_JWKS_URL,
     CONF_LOGOUT_URL,
+    CONF_OPENID_TEXT,
+    CONF_POST_LOGOUT_URL,
     CONF_SCOPE,
     CONF_TOKEN_URL,
     CONF_USER_INFO_URL,
+    CONF_TRUSTED_IPS_INPUT,
+    CONF_USE_HEADER_AUTH,
     CONF_USE_PKCE,
     CONF_VALIDATE_TLS,
 )
@@ -169,3 +177,88 @@ async def test_switching_from_discovery_to_manual_clears_oidc_metadata(
     assert CONF_ISSUER not in flow._config_data
     assert CONF_JWKS_URL not in flow._config_data
     assert CONF_ID_TOKEN_SIGNING_ALGORITHMS not in flow._config_data
+
+
+@pytest.mark.asyncio
+async def test_provider_form_rejects_ca_with_disabled_tls(
+    hass: HomeAssistant,
+) -> None:
+    """A private CA is not accepted when certificate validation is disabled."""
+    flow = OpenIDConfigFlow()
+    flow.hass = hass
+    flow._manual_mode = True
+    flow._config_data = {CONF_SCOPE: "openid profile email"}
+
+    result = await flow.async_step_provider(
+        {
+            CONF_AUTHORIZE_URL: "https://idp.example/authorize",
+            CONF_TOKEN_URL: "https://idp.example/token",
+            CONF_USER_INFO_URL: "https://idp.example/userinfo",
+            CONF_LOGOUT_URL: "",
+            CONF_VALIDATE_TLS: False,
+            CONF_CA_CERT_PATH: "certs/private-ca.pem",
+            CONF_USE_PKCE: True,
+            CONF_ISSUER: "https://idp.example",
+            CONF_JWKS_URL: "https://idp.example/jwks",
+            CONF_ID_TOKEN_SIGNING_ALGORITHMS_INPUT: "RS256",
+        }
+    )
+
+    assert result["type"] == "form"
+    assert result["errors"]["base"] == "invalid_tls_configuration"
+
+
+@pytest.mark.asyncio
+async def test_advanced_flow_requires_explicit_legacy_oauth_opt_in(
+    hass: HomeAssistant,
+) -> None:
+    """The config flow blocks an accidental downgrade from OIDC."""
+    flow = OpenIDConfigFlow()
+    flow.hass = hass
+    flow._config_data = {CONF_SCOPE: "profile email"}
+    flow.context = {"source": "user"}
+
+    result = await flow.async_step_advanced(
+        {
+            CONF_ALLOW_LEGACY_OAUTH: False,
+            CONF_BLOCK_LOGIN: False,
+            CONF_TRUSTED_IPS_INPUT: "",
+            CONF_OPENID_TEXT: "OpenID",
+            CONF_CREATE_USER: False,
+            CONF_USE_HEADER_AUTH: True,
+            CONF_ERROR_URL: "",
+            CONF_POST_LOGOUT_URL: "",
+        }
+    )
+
+    assert result["type"] == "form"
+    assert result["errors"][CONF_ALLOW_LEGACY_OAUTH] == "legacy_oauth_required"
+
+
+@pytest.mark.asyncio
+async def test_manual_provider_form_rejects_insecure_remote_endpoint(
+    hass: HomeAssistant,
+) -> None:
+    """Unsafe provider URLs are rejected before an entry is created."""
+    flow = OpenIDConfigFlow()
+    flow.hass = hass
+    flow._manual_mode = True
+    flow._config_data = {CONF_SCOPE: "openid profile email"}
+
+    result = await flow.async_step_provider(
+        {
+            CONF_AUTHORIZE_URL: "http://idp.example/authorize",
+            CONF_TOKEN_URL: "https://idp.example/token",
+            CONF_USER_INFO_URL: "https://idp.example/userinfo",
+            CONF_LOGOUT_URL: "",
+            CONF_VALIDATE_TLS: True,
+            CONF_CA_CERT_PATH: "",
+            CONF_USE_PKCE: True,
+            CONF_ISSUER: "https://idp.example",
+            CONF_JWKS_URL: "https://idp.example/jwks",
+            CONF_ID_TOKEN_SIGNING_ALGORITHMS_INPUT: "RS256",
+        }
+    )
+
+    assert result["type"] == "form"
+    assert result["errors"]["base"] == "invalid_provider_configuration"
