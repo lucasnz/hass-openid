@@ -81,3 +81,34 @@ def pop_pending(
     _cleanup(store, ttl)
     entry = store.pop(key, None)
     return dict(entry["value"]) if entry else None
+
+RATE_LIMIT_STORE = "_openid_rate_limits"
+MAX_RATE_LIMIT_KEYS = 1024
+
+
+def check_rate_limit(
+    hass: HomeAssistant,
+    key: str,
+    *,
+    limit: int,
+    window: float,
+) -> bool:
+    """Return whether a request is allowed by a bounded sliding window."""
+    now = monotonic()
+    store: dict[str, list[float]] = hass.data.setdefault(RATE_LIMIT_STORE, {})
+    cutoff = now - window
+    for stored_key, timestamps in list(store.items()):
+        recent = [timestamp for timestamp in timestamps if timestamp >= cutoff]
+        if recent:
+            store[stored_key] = recent
+        else:
+            store.pop(stored_key, None)
+
+    timestamps = store.get(key, [])
+    if len(timestamps) >= limit:
+        return False
+    if key not in store and len(store) >= MAX_RATE_LIMIT_KEYS:
+        return False
+    timestamps.append(now)
+    store[key] = timestamps
+    return True

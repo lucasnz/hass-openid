@@ -33,6 +33,10 @@ from .auth_provider import (
     OpenIDAmbiguousIdentityError,
     OpenIDIdentityConflictError,
 )
+from .auth_service import (
+    ProviderAuthenticationError,
+    async_exchange_and_validate_identity,
+)
 from .config_helpers import get_active_config
 from .identity import normalize_username
 from .const import (
@@ -60,9 +64,8 @@ from .const import (
     CRED_SUBJECT,
     DOMAIN,
 )
-from .oauth_helper import exchange_code_for_token, fetch_user_info
 from .http_security import html_response, json_response, redirect_response
-from .oidc_helper import async_validate_id_token, async_validate_logout_token
+from .oidc_helper import async_validate_logout_token
 from .state_store import (
     ANDROID_STATE_STORE,
     ANDROID_STATE_TTL,
@@ -73,6 +76,7 @@ from .state_store import (
     AUTH_STATE_STORE,
     CONSENT_STATE_STORE,
     StateStoreFull,
+    check_rate_limit,
     get_pending,
     pop_pending,
     store_pending,
@@ -183,6 +187,27 @@ def _is_android_client(client_id: str | None) -> bool:
     return client_id == "https://home-assistant.io/android"
 
 
+def _request_rate_key(request: Request, purpose: str, client_id: str = "") -> str:
+    """Return a non-secret key for public authentication rate limits."""
+    remote = request.remote or "unknown"
+    return f"{purpose}:{remote}:{client_id[:256]}"
+
+
+def _request_parameters_are_bounded(params: Mapping[str, str]) -> bool:
+    """Reject unexpectedly large public OAuth parameters."""
+    limits = {
+        "state": 4096,
+        "client_state": 4096,
+        "client_id": 2048,
+        "redirect_uri": 4096,
+        "prompt": 64,
+    }
+    return all(
+        not isinstance(params.get(key), str) or len(params[key]) <= maximum
+        for key, maximum in limits.items()
+    )
+
+
 async def _begin_provider_authorization(
     hass: HomeAssistant,
     request: Request,
@@ -192,6 +217,16 @@ async def _begin_provider_authorization(
     """Create a server-side transaction and redirect to the provider."""
     stored_params = dict(params)
     client_id = stored_params.get("client_id")
+    if not check_rate_limit(
+        hass,
+        _request_rate_key(request, "authorize", client_id or ""),
+        limit=30,
+        window=5 * 60,
+    ):
+        return html_response(
+            "Too many OpenID sign-in attempts; try again shortly",
+            status=HTTPStatus.TOO_MANY_REQUESTS,
+        )
     client_state = stored_params.get("client_state") or stored_params.get("state")
     if client_state:
         stored_params["client_state"] = client_state
@@ -350,6 +385,8 @@ class OpenIDAuthorizeView(HomeAssistantView):
             )
 
         params = dict(request.rel_url.query)
+        if not _request_parameters_are_bounded(params):
+            return Response(status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
         if not await _validate_client_request(self.hass, params):
             _LOGGER.warning("Rejected invalid OAuth client or redirect URI")
             return Response(
@@ -503,98 +540,31 @@ class OpenIDCallbackView(HomeAssistantView):
         base_url = params.get("base_url", "")
         redirect_uri = str(URL(base_url).with_path("/auth/openid/callback"))
 
-        token_data: dict[str, Any] | None = None
-        user_info: dict[str, Any] | None = None
         try:
-            token_data = await exchange_code_for_token(
-                hass=self.hass,
-                token_url=conf[CONF_TOKEN_URL],
+            identity = await async_exchange_and_validate_identity(
+                self.hass,
+                config=conf,
                 code=code,
-                client_id=conf[CONF_CLIENT_ID],
-                client_secret=conf[CONF_CLIENT_SECRET],
                 redirect_uri=redirect_uri,
-                use_header_auth=bool(conf.get(CONF_USE_HEADER_AUTH, True)),
+                nonce=params.get(_OIDC_NONCE_KEY),
                 code_verifier=params.get(_PKCE_VERIFIER_KEY),
             )
-
-            id_token_claims: dict[str, Any] | None = None
-            openid_requested = "openid" in conf.get(CONF_SCOPE, "").split()
-            if openid_requested:
-                id_token = token_data.get("id_token")
-                nonce = params.get(_OIDC_NONCE_KEY)
-                issuer = conf.get(CONF_ISSUER)
-                jwks_url = conf.get(CONF_JWKS_URL)
-                algorithms = conf.get(
-                    CONF_ID_TOKEN_SIGNING_ALGORITHMS, ["RS256"]
-                )
-                if isinstance(algorithms, str):
-                    algorithms = [algorithms]
-                if not all((id_token, nonce, issuer, jwks_url)):
-                    raise ValueError(
-                        "OIDC validation metadata or ID token is missing; "
-                        "use provider discovery for OpenID scope"
-                    )
-                id_token_claims = await async_validate_id_token(
-                    self.hass,
-                    id_token=id_token,
-                    issuer=issuer,
-                    jwks_url=jwks_url,
-                    client_id=conf[CONF_CLIENT_ID],
-                    nonce=nonce,
-                    algorithms=list(algorithms),
-                    validate_tls=bool(conf.get(CONF_VALIDATE_TLS, True)),
-                )
-
-            access_token = token_data.get("access_token")
-            if not isinstance(access_token, str):
-                _LOGGER.error("Token response missing access token")
-                return _show_error(
-                    self.hass,
-                    params,
-                    alert_type="error",
-                    alert_message="OpenID login failed! Access token missing in provider response.",
-                )
-
-            user_info = await fetch_user_info(
-                hass=self.hass,
-                user_info_url=conf[CONF_USER_INFO_URL],
-                access_token=access_token,
-            )
-            if id_token_claims is not None:
-                userinfo_sub = user_info.get("sub")
-                token_sub = id_token_claims.get("sub")
-                if not isinstance(userinfo_sub, str) or userinfo_sub != token_sub:
-                    raise ValueError(
-                        "UserInfo subject does not match the validated ID token"
-                    )
-        except Exception:
-            _LOGGER.exception("Token exchange or user info fetch failed")
-            return _show_error(
-                self.hass,
-                params,
-                alert_type="error",
-                alert_message="OpenID login failed! Could not exchange code for tokens or fetch user info.",
-            )
-
-        username_field = conf[CONF_USERNAME_FIELD]
-        raw_username = user_info.get(username_field) if user_info else None
-        try:
-            username = normalize_username(raw_username)
-        except ValueError as err:
+        except ProviderAuthenticationError as err:
             _LOGGER.warning(
-                "Invalid username claim %s: %s",
-                username_field,
+                "Provider identity validation failed for transaction %s: %s",
+                _short_id(state),
                 err,
             )
             return _show_error(
                 self.hass,
                 params,
                 alert_type="error",
-                alert_message=(
-                    "OpenID login failed! The configured username claim is "
-                    "missing, empty, or not a string."
-                ),
+                alert_message=err.public_message,
             )
+
+        token_data = identity.token_data
+        username = identity.username
+        new_credential_fields = identity.credential_fields
 
         provider = self.hass.data[DOMAIN].get("auth_provider")
         if provider is None:
@@ -604,32 +574,6 @@ class OpenIDCallbackView(HomeAssistantView):
                 params,
                 alert_type="error",
                 alert_message="OpenID login failed! Auth provider not available.",
-            )
-
-        new_credential_fields = {
-            key: value
-            for key, value in (
-                ("username", username),
-                ("name", user_info.get("name") or user_info.get("preferred_username")),
-                ("email", user_info.get("email")),
-                ("preferred_username", user_info.get("preferred_username")),
-            )
-            if value
-        }
-        if id_token_claims is not None:
-            new_credential_fields[CRED_ISSUER] = id_token_claims["iss"]
-            new_credential_fields[CRED_SUBJECT] = id_token_claims["sub"]
-            if isinstance(id_token_claims.get("sid"), str):
-                new_credential_fields[CRED_SESSION_ID] = id_token_claims["sid"]
-
-        if username_field == "email" and user_info.get("email_verified") is False:
-            return _show_error(
-                self.hass,
-                params,
-                alert_type="error",
-                alert_message=(
-                    "OpenID login failed! The provider has not verified the email address."
-                ),
             )
 
         try:
@@ -1157,6 +1101,16 @@ class OpenIDAndroidStatusView(HomeAssistantView):
     async def get(self, request: Request) -> Response:
         """Return completion status for a given OAuth state."""
         transaction_id = request.rel_url.query.get("transaction")
+        if not check_rate_limit(
+            self.hass,
+            _request_rate_key(request, "android-status", transaction_id or ""),
+            limit=120,
+            window=5 * 60,
+        ):
+            return json_response(
+                {"status": "error", "message": "Too many requests"},
+                status=HTTPStatus.TOO_MANY_REQUESTS,
+            )
         poll_secret = request.cookies.get(_ANDROID_POLL_COOKIE)
         if not transaction_id or not poll_secret:
             return json_response(
