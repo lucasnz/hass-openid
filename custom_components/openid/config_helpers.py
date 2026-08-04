@@ -2,15 +2,11 @@
 
 from __future__ import annotations
 
-from http import HTTPStatus
-
-from aiohttp import ClientTimeout
 from ipaddress import IPv4Network, IPv6Network, ip_network
 import logging
 from typing import Any
 
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import aiohttp_client
 
 from .const import (
     CONF_AUTHORIZE_URL,
@@ -26,6 +22,11 @@ from .const import (
     DEFAULT_VALIDATE_TLS,
     DISCOVERY_PKCE_AVAILABLE,
     DOMAIN,
+)
+from .network import (
+    MAX_DISCOVERY_BYTES,
+    async_request_json_object,
+    validate_provider_url,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -48,7 +49,6 @@ def set_active_config(
 ) -> dict[str, Any] | None:
     """Set the active runtime configuration."""
     store = get_domain_data(hass)
-
     if raw_config is None:
         store.pop(DATA_ACTIVE_CONFIG, None)
         return None
@@ -80,33 +80,80 @@ def build_runtime_config(raw_config: dict[str, Any]) -> dict[str, Any]:
     return runtime_config
 
 
+def validate_runtime_provider_urls(config: dict[str, Any]) -> None:
+    """Validate every configured provider endpoint before activating it."""
+    for key in (
+        CONF_AUTHORIZE_URL,
+        CONF_TOKEN_URL,
+        CONF_USER_INFO_URL,
+        CONF_JWKS_URL,
+        CONF_LOGOUT_URL,
+    ):
+        if value := config.get(key):
+            config[key] = validate_provider_url(value, field=key)
+
+    if issuer := config.get(CONF_ISSUER):
+        config[CONF_ISSUER] = validate_provider_url(issuer, field=CONF_ISSUER).rstrip(
+            "/"
+        )
+
+
 async def async_discover_configuration(
     hass: HomeAssistant,
     configure_url: str,
     validate_tls: bool = DEFAULT_VALIDATE_TLS,
+    expected_issuer: str | None = None,
 ) -> dict[str, Any]:
-    """Fetch OpenID endpoints from the discovery endpoint."""
-    session = aiohttp_client.async_get_clientsession(hass, verify_ssl=validate_tls)
+    """Fetch and strictly validate an OpenID discovery document."""
+    configure_url = validate_provider_url(
+        configure_url, field="OpenID discovery URL"
+    )
+    _LOGGER.debug("Fetching OpenID discovery metadata")
+    config_data = await async_request_json_object(
+        hass,
+        "GET",
+        configure_url,
+        validate_tls=validate_tls,
+        endpoint_name="OpenID discovery endpoint",
+        max_bytes=MAX_DISCOVERY_BYTES,
+    )
 
-    _LOGGER.debug("Fetching OpenID configuration from %s", configure_url)
-    async with session.get(
-        configure_url, timeout=ClientTimeout(total=15)
-    ) as resp:
-        if resp.status != HTTPStatus.OK:
-            raise RuntimeError(f"Configuration endpoint returned {resp.status}")
+    issuer = config_data.get("issuer")
+    if not isinstance(issuer, str):
+        raise ValueError("OpenID discovery metadata is missing a string issuer")
+    issuer = validate_provider_url(issuer, field="issuer").rstrip("/")
+    if expected_issuer and issuer != expected_issuer.rstrip("/"):
+        raise ValueError("OpenID discovery issuer changed unexpectedly")
 
-        config_data = await resp.json()
+    endpoint_mapping = {
+        CONF_AUTHORIZE_URL: "authorization_endpoint",
+        CONF_TOKEN_URL: "token_endpoint",
+        CONF_USER_INFO_URL: "userinfo_endpoint",
+        CONF_JWKS_URL: "jwks_uri",
+        CONF_LOGOUT_URL: "end_session_endpoint",
+    }
+    result: dict[str, Any] = {CONF_ISSUER: issuer}
+    for target, source in endpoint_mapping.items():
+        value = config_data.get(source)
+        if value is None and target == CONF_LOGOUT_URL:
+            continue
+        if not isinstance(value, str):
+            raise ValueError(f"OpenID discovery metadata is missing {source}")
+        result[target] = validate_provider_url(value, field=source)
+
+    algorithms = config_data.get(
+        "id_token_signing_alg_values_supported", ["RS256"]
+    )
+    if (
+        not isinstance(algorithms, list)
+        or not algorithms
+        or not all(isinstance(value, str) and value for value in algorithms)
+    ):
+        raise ValueError("Invalid ID token signing algorithm metadata")
+    result[CONF_ID_TOKEN_SIGNING_ALGORITHMS] = algorithms
 
     pkce_methods = config_data.get("code_challenge_methods_supported", [])
-    return {
-        CONF_AUTHORIZE_URL: config_data.get("authorization_endpoint"),
-        CONF_TOKEN_URL: config_data.get("token_endpoint"),
-        CONF_USER_INFO_URL: config_data.get("userinfo_endpoint"),
-        CONF_LOGOUT_URL: config_data.get("end_session_endpoint"),
-        CONF_ISSUER: config_data.get("issuer"),
-        CONF_JWKS_URL: config_data.get("jwks_uri"),
-        CONF_ID_TOKEN_SIGNING_ALGORITHMS: config_data.get(
-            "id_token_signing_alg_values_supported", ["RS256"]
-        ),
-        DISCOVERY_PKCE_AVAILABLE: "S256" in pkce_methods,
-    }
+    if not isinstance(pkce_methods, list):
+        raise ValueError("Invalid PKCE discovery metadata")
+    result[DISCOVERY_PKCE_AVAILABLE] = "S256" in pkce_methods
+    return result

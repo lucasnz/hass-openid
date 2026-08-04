@@ -1,17 +1,21 @@
 """OpenID Connect OAuth helpers for Home Assistant."""
 
-from base64 import b64encode
-from http import HTTPStatus
+from __future__ import annotations
 
-from aiohttp import ClientTimeout
+from base64 import b64encode
 import logging
 from typing import Any
+from urllib.parse import quote_plus
 
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import aiohttp_client
 
 from .config_helpers import get_active_config
 from .const import CONF_VALIDATE_TLS, DEFAULT_VALIDATE_TLS
+from .network import (
+    MAX_TOKEN_BYTES,
+    MAX_USERINFO_BYTES,
+    async_request_json_object,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -28,45 +32,46 @@ async def exchange_code_for_token(
     use_header_auth: bool = True,
     code_verifier: str | None = None,
 ) -> dict[str, Any]:
-    """Exchange the *authorisation code* for tokens at the IdP."""
+    """Exchange the authorisation code for tokens at the IdP."""
     if validate_tls is None:
         config = get_active_config(hass) or {}
         validate_tls = bool(config.get(CONF_VALIDATE_TLS, DEFAULT_VALIDATE_TLS))
-
-    session = aiohttp_client.async_get_clientsession(hass, verify_ssl=validate_tls)
 
     data = {
         "grant_type": "authorization_code",
         "code": code,
         "redirect_uri": redirect_uri,
     }
-
     if code_verifier is not None:
         data["code_verifier"] = code_verifier
 
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
-
     if use_header_auth:
-        credentials = f"{client_id}:{client_secret}"
-        encoded_credentials = b64encode(credentials.encode("utf-8")).decode("utf-8")
+        # RFC 6749 section 2.3.1 requires each component to be form-encoded
+        # before joining them with a colon and applying Base64.
+        credentials = (
+            f"{quote_plus(client_id, safe='')}:{quote_plus(client_secret, safe='')}"
+        )
+        encoded_credentials = b64encode(credentials.encode()).decode("ascii")
         headers["Authorization"] = f"Basic {encoded_credentials}"
     else:
         _LOGGER.warning(
-            "Using client id and secret in request body might expose them, when your IdP logging is wrongly configured. Use with caution"
+            "Sending the OpenID client secret in the token request body; ensure provider request logging is protected"
         )
         data["client_id"] = client_id
         data["client_secret"] = client_secret
 
-    _LOGGER.debug("Exchanging code for token at %s", token_url)
-    async with session.post(
+    _LOGGER.debug("Exchanging an authorization code at the configured token endpoint")
+    return await async_request_json_object(
+        hass,
+        "POST",
         token_url,
-        data=data,
+        validate_tls=validate_tls,
+        endpoint_name="token endpoint",
+        max_bytes=MAX_TOKEN_BYTES,
         headers=headers,
-        timeout=ClientTimeout(total=15),
-    ) as resp:
-        if resp.status != HTTPStatus.OK:
-            raise RuntimeError(f"Token endpoint returned HTTP {resp.status}")
-        return await resp.json()
+        data=data,
+    )
 
 
 async def fetch_user_info(
@@ -75,18 +80,17 @@ async def fetch_user_info(
     access_token: str,
     validate_tls: bool | None = None,
 ) -> dict[str, Any]:
-    """Fetch user information from the user info endpoint."""
+    """Fetch user information from the UserInfo endpoint."""
     if validate_tls is None:
         config = get_active_config(hass) or {}
         validate_tls = bool(config.get(CONF_VALIDATE_TLS, DEFAULT_VALIDATE_TLS))
 
-    session = aiohttp_client.async_get_clientsession(hass, verify_ssl=validate_tls)
-    headers = {"Authorization": f"Bearer {access_token}"}
-
-    _LOGGER.debug("Fetching user info from %s", user_info_url)
-    async with session.get(
-        user_info_url, headers=headers, timeout=ClientTimeout(total=15)
-    ) as resp:
-        if resp.status != HTTPStatus.OK:
-            raise RuntimeError(f"User info endpoint returned HTTP {resp.status}")
-        return await resp.json()
+    return await async_request_json_object(
+        hass,
+        "GET",
+        user_info_url,
+        validate_tls=validate_tls,
+        endpoint_name="UserInfo endpoint",
+        max_bytes=MAX_USERINFO_BYTES,
+        headers={"Authorization": f"Bearer {access_token}"},
+    )

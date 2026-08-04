@@ -27,6 +27,7 @@ from .config_helpers import (
     async_discover_configuration,
     get_active_config,
     set_active_config,
+    validate_runtime_provider_urls,
 )
 from .const import (
     CONF_ALLOW_LEGACY_OAUTH,
@@ -218,6 +219,7 @@ async def _async_prepare_config(
                 validate_tls=bool(
                     config.get(CONF_VALIDATE_TLS, DEFAULT_VALIDATE_TLS)
                 ),
+                expected_issuer=config.get(CONF_ISSUER),
             )
             for key in (CONF_AUTHORIZE_URL, CONF_TOKEN_URL, CONF_USER_INFO_URL):
                 if not config.get(key) and discovered.get(key):
@@ -249,6 +251,7 @@ async def _async_prepare_config(
             f"OpenID {source} did not provide required values: {', '.join(missing)}"
         )
 
+    validate_runtime_provider_urls(config)
     return config
 
 
