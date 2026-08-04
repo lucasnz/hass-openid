@@ -17,6 +17,7 @@ CONF_USERNAME_FIELD = "username_field"
 CONF_SCOPE = "scope"
 
 CONF_CREATE_USER = "create_user"
+CONF_ALLOW_LEGACY_OAUTH = "allow_legacy_oauth"
 CONF_BLOCK_LOGIN = "block_login"
 CONF_POST_LOGOUT_URL = "post_logout_url"
 CONF_ERROR_URL = "error_url"
@@ -47,6 +48,8 @@ FLOW_DEFAULT_TRUSTED_IPS = [
     "10.0.0.0/8",
 ]
 
+CRED_ISSUER = "openid_issuer"
+CRED_SUBJECT = "openid_subject"
 CRED_ID_TOKEN = "openid_id_token"
 CRED_SESSION_STATE = "openid_session_state"
 CRED_LOGOUT_REDIRECT_URI = "openid_logout_redirect_uri"

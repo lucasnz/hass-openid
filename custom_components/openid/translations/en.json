@@ -1,12 +1,12 @@
 {
   "config": {
     "abort": {
-      "already_configured": "OpenID / OAuth2 is already configured",
-      "reconfigure_successful": "Reconfiguration was successful",
-      "single_instance_allowed": "Only a single OpenID / OAuth2 configuration is allowed"
+      "already_configured": "[%key:common::config_flow::abort::already_configured_service%]",
+      "reconfigure_successful": "[%key:common::config_flow::abort::reconfigure_successful%]",
+      "single_instance_allowed": "[%key:common::config_flow::abort::single_instance_allowed%]"
     },
     "error": {
-      "cannot_connect": "Failed to connect",
+      "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
       "invalid_cidr": "Enter one valid CIDR block per line",
       "invalid_discovery": "The discovery endpoint did not return the required OpenID endpoints",
       "invalid_ssl_certificate": "TLS certificate validation failed while connecting to the provider",
@@ -16,6 +16,7 @@
     "step": {
       "advanced": {
         "data": {
+          "allow_legacy_oauth": "Allow legacy OAuth UserInfo identity mode",
           "block_login": "Block other login methods",
           "create_user": "Create Home Assistant users automatically",
           "error_url": "Custom error redirect URL",
@@ -25,6 +26,7 @@
           "post_logout_url": "Post-logout redirect URL"
         },
         "data_description": {
+          "allow_legacy_oauth": "Permit authentication without the openid scope. This skips ID-token issuer, audience, signature, and nonce validation and should be used only for a trusted legacy OAuth provider.",
           "block_login": "Only allow OpenID login unless the client IP matches one of the trusted IPv4 or IPv6 CIDR blocks below",
           "create_user": "Automatically create a Home Assistant user the first time someone signs in",
           "error_url": "Optional URL to redirect to instead of showing the built-in OpenID error page",
@@ -94,7 +96,7 @@
         "description": "{pkce_message}"
       },
       "reconfigure": {
-        "description": "Choose whether to discover the provider endpoints from a configure URL or enter the endpoint URLs manually."
+        "description": "[%key:component::openid::config::step::user::description%]"
       },
       "user": {
         "description": "Choose whether to discover the provider endpoints from a configure URL or enter the endpoint URLs manually.",

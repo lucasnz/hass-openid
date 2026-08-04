@@ -29,6 +29,7 @@ from .config_helpers import (
     set_active_config,
 )
 from .const import (
+    CONF_ALLOW_LEGACY_OAUTH,
     CONF_AUTHORIZE_URL,
     CONF_BLOCK_LOGIN,
     CONF_POST_LOGOUT_URL,
@@ -73,6 +74,7 @@ CONFIG_SCHEMA = vol.Schema(
             {
                 vol.Required(CONF_CLIENT_ID): cv.string,
                 vol.Required(CONF_CLIENT_SECRET): cv.string,
+                vol.Optional(CONF_ALLOW_LEGACY_OAUTH, default=False): cv.boolean,
                 vol.Optional(CONF_AUTHORIZE_URL): cv.url,
                 vol.Optional(CONF_TOKEN_URL): cv.url,
                 vol.Optional(CONF_USER_INFO_URL): cv.url,
@@ -185,6 +187,10 @@ async def _async_prepare_config(
     """Prepare raw config for runtime use."""
     config.setdefault(CONF_VALIDATE_TLS, DEFAULT_VALIDATE_TLS)
     openid_requested = "openid" in config.get(CONF_SCOPE, DEFAULT_SCOPE).split()
+    if not openid_requested and not config.get(CONF_ALLOW_LEGACY_OAUTH, False):
+        raise RuntimeError(
+            "The openid scope is required unless legacy OAuth UserInfo mode is explicitly enabled"
+        )
 
     if CONF_CONFIGURE_URL in config:
         needs_discovery = (

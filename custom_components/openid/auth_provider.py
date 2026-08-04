@@ -23,23 +23,27 @@ from homeassistant.auth.providers import (
 )
 from homeassistant.core import HomeAssistant
 
-from .const import DOMAIN
+from .const import CRED_ISSUER, CRED_SUBJECT, DOMAIN
 from .identity import normalize_username
 
 OPENID_AUTH_PROVIDER_SCHEMA = AUTH_PROVIDER_SCHEMA.extend({}, extra=vol.ALLOW_EXTRA)
 
 
-class OpenIDLoginFlow(LoginFlow["OpenIDAuthProvider"]):
-    """Dummy login flow for OpenID provider.
+class OpenIDIdentityConflictError(ValueError):
+    """Raised when a username is already bound to another OIDC identity."""
 
-    The actual login is driven by the external OpenID flow that this component
-    injects into the frontend, so a local login flow is not expected to run.
-    """
+
+class OpenIDAmbiguousIdentityError(ValueError):
+    """Raised when more than one credential could own an identity."""
+
+
+class OpenIDLoginFlow(LoginFlow["OpenIDAuthProvider"]):
+    """Dummy login flow for OpenID provider."""
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> AuthFlowResult:
-        """Abort: the flow should be handled externally."""
+        """Abort: the flow is handled by the external OpenID exchange."""
         return self.async_abort(reason="external_auth_not_supported")
 
 
@@ -57,29 +61,82 @@ class OpenIDAuthProvider(AuthProvider):
         return OpenIDLoginFlow(self)
 
     async def async_get_or_create_credentials(
-        self, flow_result: Mapping[str, str]
+        self, flow_result: Mapping[str, Any]
     ) -> Credentials:
-        """Return existing credentials or create new ones for username."""
+        """Resolve credentials by stable OIDC identity, then initial username."""
         username = normalize_username(flow_result.get("username"))
+        issuer = flow_result.get(CRED_ISSUER)
+        subject = flow_result.get(CRED_SUBJECT)
+        if issuer is not None and not isinstance(issuer, str):
+            raise ValueError("OIDC issuer must be a string")
+        if subject is not None and not isinstance(subject, str):
+            raise ValueError("OIDC subject must be a string")
+        issuer = issuer.strip() if isinstance(issuer, str) else None
+        subject = subject.strip() if isinstance(subject, str) else None
+        if bool(issuer) != bool(subject):
+            raise ValueError("OIDC issuer and subject must be supplied together")
+
         credential_data = dict(flow_result)
         credential_data["username"] = username
+        if issuer and subject:
+            credential_data[CRED_ISSUER] = issuer
+            credential_data[CRED_SUBJECT] = subject
 
-        matches: list[Credentials] = []
-        for credentials in await self.async_credentials():
+        credentials_list = list(await self.async_credentials())
+
+        # Once linked, issuer + subject is authoritative. Username remains a
+        # mutable account-mapping/display attribute and may legitimately change.
+        stable_matches = [
+            credentials
+            for credentials in credentials_list
+            if issuer
+            and subject
+            and credentials.data.get(CRED_ISSUER) == issuer
+            and credentials.data.get(CRED_SUBJECT) == subject
+        ]
+        if len(stable_matches) > 1:
+            raise OpenIDAmbiguousIdentityError(
+                "Multiple OpenID credentials match the issuer and subject"
+            )
+        if stable_matches:
+            credentials = stable_matches[0]
+            credentials.data.update(credential_data)
+            credentials.is_new = False
+            return credentials
+
+        username_matches: list[Credentials] = []
+        for credentials in credentials_list:
             try:
                 stored_username = normalize_username(
                     credentials.data.get("username")
                 )
             except ValueError:
                 continue
-
             if stored_username == username:
-                matches.append(credentials)
+                username_matches.append(credentials)
 
-        if len(matches) > 1:
-            raise ValueError("Multiple OpenID credentials match the username")
-        if matches:
-            credentials = matches[0]
+        if len(username_matches) > 1:
+            raise OpenIDAmbiguousIdentityError(
+                "Multiple OpenID credentials match the username"
+            )
+        if username_matches:
+            credentials = username_matches[0]
+            stored_issuer = credentials.data.get(CRED_ISSUER)
+            stored_subject = credentials.data.get(CRED_SUBJECT)
+
+            # Permit a one-time migration of credentials created before stable
+            # identity binding was introduced. Never rebind an already-bound
+            # username to a different issuer or subject.
+            if stored_issuer or stored_subject:
+                if not issuer or not subject:
+                    raise OpenIDIdentityConflictError(
+                        "The username is bound to an OIDC identity and cannot be used by an unverified OAuth identity"
+                    )
+                if stored_issuer != issuer or stored_subject != subject:
+                    raise OpenIDIdentityConflictError(
+                        "The username is already bound to another OIDC identity"
+                    )
+
             credentials.data.update(credential_data)
             credentials.is_new = False
             return credentials

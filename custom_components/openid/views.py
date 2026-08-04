@@ -29,6 +29,10 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.network import NoURLAvailableError, get_url
 from homeassistant.util import slugify
 
+from .auth_provider import (
+    OpenIDAmbiguousIdentityError,
+    OpenIDIdentityConflictError,
+)
 from .config_helpers import get_active_config
 from .identity import normalize_username
 from .const import (
@@ -49,8 +53,10 @@ from .const import (
     CONF_USERNAME_FIELD,
     CONF_VALIDATE_TLS,
     CRED_ID_TOKEN,
+    CRED_ISSUER,
     CRED_LOGOUT_REDIRECT_URI,
     CRED_SESSION_STATE,
+    CRED_SUBJECT,
     DOMAIN,
 )
 from .oauth_helper import exchange_code_for_token, fetch_user_info
@@ -600,15 +606,47 @@ class OpenIDCallbackView(HomeAssistantView):
                 ("username", username),
                 ("name", user_info.get("name") or user_info.get("preferred_username")),
                 ("email", user_info.get("email")),
-                ("subject", user_info.get("sub")),
                 ("preferred_username", user_info.get("preferred_username")),
             )
             if value
         }
+        if id_token_claims is not None:
+            new_credential_fields[CRED_ISSUER] = id_token_claims["iss"]
+            new_credential_fields[CRED_SUBJECT] = id_token_claims["sub"]
+
+        if username_field == "email" and user_info.get("email_verified") is False:
+            return _show_error(
+                self.hass,
+                params,
+                alert_type="error",
+                alert_message=(
+                    "OpenID login failed! The provider has not verified the email address."
+                ),
+            )
 
         try:
             credentials = await provider.async_get_or_create_credentials(
                 new_credential_fields
+            )
+        except OpenIDIdentityConflictError as err:
+            _LOGGER.warning("Refusing OIDC identity rebind: %s", err)
+            return _show_error(
+                self.hass,
+                params,
+                alert_type="error",
+                alert_message=(
+                    "OpenID login failed! This username is already linked to a different identity."
+                ),
+            )
+        except OpenIDAmbiguousIdentityError as err:
+            _LOGGER.warning("Refusing ambiguous OpenID identity: %s", err)
+            return _show_error(
+                self.hass,
+                params,
+                alert_type="error",
+                alert_message=(
+                    "OpenID login failed! More than one credential matches this identity."
+                ),
             )
         except ValueError as err:  # pragma: no cover - defensive guard
             _LOGGER.error("Failed to obtain credentials: %s", err)
@@ -664,6 +702,14 @@ class OpenIDCallbackView(HomeAssistantView):
                         "Failed to link credentials to existing user %s: %s",
                         username_value,
                         err,
+                    )
+                    return _show_error(
+                        self.hass,
+                        params,
+                        alert_type="error",
+                        alert_message=(
+                            "OpenID login failed! The matching Home Assistant account could not be linked."
+                        ),
                     )
                 else:
                     credential_data.setdefault("openid_groups_initialized", True)
@@ -802,11 +848,15 @@ class OpenIDCallbackView(HomeAssistantView):
 
         if token_data and (id_token := token_data.get("id_token")):
             credential_data[CRED_ID_TOKEN] = id_token
+        else:
+            credential_data.pop(CRED_ID_TOKEN, None)
 
         if session_state_param := params.get("session_state"):
             credential_data[CRED_SESSION_STATE] = session_state_param
         elif token_data and (session_state := token_data.get("session_state")):
             credential_data[CRED_SESSION_STATE] = session_state
+        else:
+            credential_data.pop(CRED_SESSION_STATE, None)
 
         if postlogout_redirect_url:
             credential_data[CRED_LOGOUT_REDIRECT_URI] = postlogout_redirect_url

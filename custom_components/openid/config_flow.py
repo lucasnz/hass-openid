@@ -26,6 +26,7 @@ from homeassistant.helpers.selector import (
 
 from .config_helpers import async_discover_configuration
 from .const import (
+    CONF_ALLOW_LEGACY_OAUTH,
     CONF_AUTHORIZE_URL,
     CONF_BLOCK_LOGIN,
     CONF_CONFIGURE_URL,
@@ -520,6 +521,9 @@ class OpenIDConfigFlow(ConfigFlow, domain=DOMAIN):
             else:
                 self._config_data.update(
                     {
+                        CONF_ALLOW_LEGACY_OAUTH: user_input[
+                            CONF_ALLOW_LEGACY_OAUTH
+                        ],
                         CONF_BLOCK_LOGIN: user_input[CONF_BLOCK_LOGIN],
                         CONF_TRUSTED_IPS: trusted_ips,
                         CONF_OPENID_TEXT: user_input[CONF_OPENID_TEXT].strip(),
@@ -549,6 +553,9 @@ class OpenIDConfigFlow(ConfigFlow, domain=DOMAIN):
                 return self.async_create_entry(title=TITLE, data=self._config_data)
 
         suggested_values = user_input or {
+            CONF_ALLOW_LEGACY_OAUTH: self._config_data.get(
+                CONF_ALLOW_LEGACY_OAUTH, False
+            ),
             CONF_BLOCK_LOGIN: self._config_data.get(
                 CONF_BLOCK_LOGIN, FLOW_DEFAULT_BLOCK_LOGIN
             ),
@@ -573,6 +580,7 @@ class OpenIDConfigFlow(ConfigFlow, domain=DOMAIN):
             data_schema=self.add_suggested_values_to_schema(
                 vol.Schema(
                     {
+                        vol.Required(CONF_ALLOW_LEGACY_OAUTH): BooleanSelector(),
                         vol.Required(CONF_BLOCK_LOGIN): BooleanSelector(),
                         vol.Optional(CONF_TRUSTED_IPS_INPUT): _text_selector(
                             multiline=True

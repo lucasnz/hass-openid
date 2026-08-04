@@ -17,6 +17,7 @@
     "step": {
       "advanced": {
         "data": {
+          "allow_legacy_oauth": "Allow legacy OAuth UserInfo identity mode",
           "block_login": "Block other login methods",
           "create_user": "Create Home Assistant users automatically",
           "error_url": "Custom error redirect URL",
@@ -26,6 +27,7 @@
           "post_logout_url": "Post-logout redirect URL"
         },
         "data_description": {
+          "allow_legacy_oauth": "Permit authentication without the openid scope. This skips ID-token issuer, audience, signature, and nonce validation and should be used only for a trusted legacy OAuth provider.",
           "block_login": "Only allow OpenID login unless the client IP matches one of the trusted IPv4 or IPv6 CIDR blocks below",
           "create_user": "Automatically create a Home Assistant user the first time someone signs in",
           "error_url": "Optional URL to redirect to instead of showing the built-in OpenID error page",
@@ -37,74 +39,27 @@
         "description": "Configure the remaining login behavior and defaults."
       },
       "credentials": {
-        "data": {
-          "client_id": "Client ID",
-          "client_secret": "Client secret"
-        },
-        "data_description": {
-          "client_id": "OAuth2/OpenID client ID for Home Assistant",
-          "client_secret": "OAuth2/OpenID client secret for Home Assistant"
-        },
+        "data": {"client_id": "Client ID", "client_secret": "Client secret"},
+        "data_description": {"client_id": "OAuth2/OpenID client ID for Home Assistant", "client_secret": "OAuth2/OpenID client secret for Home Assistant"},
         "description": "Enter the client credentials Home Assistant should use with the provider."
       },
       "discovery": {
-        "data": {
-          "configure_url": "Configure URL",
-          "validate_tls": "Validate TLS certificate"
-        },
-        "data_description": {
-          "configure_url": "Discovery endpoint, usually the provider's OpenID configuration URL",
-          "validate_tls": "Verify the provider TLS certificate when fetching the discovery document"
-        },
+        "data": {"configure_url": "Configure URL", "validate_tls": "Validate TLS certificate"},
+        "data_description": {"configure_url": "Discovery endpoint, usually the provider's OpenID configuration URL", "validate_tls": "Verify the provider TLS certificate when fetching the discovery document"},
         "description": "Enter the configure URL to discover the provider endpoints automatically."
       },
       "identity": {
-        "data": {
-          "scope": "Requested scope",
-          "username_field": "Username field"
-        },
-        "data_description": {
-          "scope": "OAuth2/OpenID scope to request from the provider",
-          "username_field": "Claim to use as the Home Assistant username, for example `preferred_username` or `email`"
-        },
+        "data": {"scope": "Requested scope", "username_field": "Username field"},
+        "data_description": {"scope": "OAuth2/OpenID scope to request from the provider", "username_field": "Claim to use as the Home Assistant username, for example `preferred_username` or `email`"},
         "description": "Choose which claims to request and which user info field should become the Home Assistant username."
       },
       "provider": {
-        "data": {
-          "authorize_url": "Authorization endpoint",
-          "logout_url": "Logout endpoint",
-          "token_url": "Token endpoint",
-          "use_pkce": "Use PKCE",
-          "user_info_url": "User info endpoint",
-          "validate_tls": "Validate TLS certificate",
-          "issuer": "Issuer",
-          "jwks_url": "JWKS endpoint",
-          "id_token_signing_algorithms_input": "ID token signing algorithms"
-        },
-        "data_description": {
-          "authorize_url": "Authorization endpoint",
-          "logout_url": "Optional logout endpoint",
-          "token_url": "Token endpoint",
-          "use_pkce": "Whether the authorization flow should use PKCE",
-          "user_info_url": "User info endpoint",
-          "validate_tls": "Verify the provider TLS certificate for discovery, token, and user info requests",
-          "issuer": "OIDC issuer identifier; required for manual OpenID configuration",
-          "jwks_url": "JWKS endpoint used to validate ID token signatures",
-          "id_token_signing_algorithms_input": "Comma-separated allowed algorithms, for example RS256 or ES256"
-        },
+        "data": {"authorize_url": "Authorization endpoint", "logout_url": "Logout endpoint", "token_url": "Token endpoint", "use_pkce": "Use PKCE", "user_info_url": "User info endpoint", "validate_tls": "Validate TLS certificate", "issuer": "Issuer", "jwks_url": "JWKS endpoint", "id_token_signing_algorithms_input": "ID token signing algorithms"},
+        "data_description": {"authorize_url": "Authorization endpoint", "logout_url": "Optional logout endpoint", "token_url": "Token endpoint", "use_pkce": "Whether the authorization flow should use PKCE", "user_info_url": "User info endpoint", "validate_tls": "Verify the provider TLS certificate for discovery, token, and user info requests", "issuer": "OIDC issuer identifier; required for manual OpenID configuration", "jwks_url": "JWKS endpoint used to validate ID token signatures", "id_token_signing_algorithms_input": "Comma-separated allowed algorithms, for example RS256 or ES256"},
         "description": "{pkce_message}"
       },
-      "reconfigure": {
-        "description": "[%key:component::openid::config::step::user::description%]"
-      },
-      "user": {
-        "description": "Choose whether to discover the provider endpoints from a configure URL or enter the endpoint URLs manually.",
-        "menu_options": {
-          "discovery": "Use configure URL",
-          "manual": "Enter URLs manually"
-        },
-        "title": "Configure provider"
-      }
+      "reconfigure": {"description": "[%key:component::openid::config::step::user::description%]"},
+      "user": {"description": "Choose whether to discover the provider endpoints from a configure URL or enter the endpoint URLs manually.", "menu_options": {"discovery": "Use configure URL", "manual": "Enter URLs manually"}, "title": "Configure provider"}
     }
   }
 }
