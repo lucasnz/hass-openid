@@ -50,6 +50,7 @@ FLOW_DEFAULT_TRUSTED_IPS = [
 
 CRED_ISSUER = "openid_issuer"
 CRED_SUBJECT = "openid_subject"
+CRED_SESSION_ID = "openid_session_id"
 CRED_ID_TOKEN = "openid_id_token"
 CRED_SESSION_STATE = "openid_session_state"
 CRED_LOGOUT_REDIRECT_URI = "openid_logout_redirect_uri"

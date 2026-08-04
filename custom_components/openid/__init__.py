@@ -493,6 +493,7 @@ async def _async_setup_shared(hass: HomeAssistant) -> None:
     hass.http.register_view(openid_views.OpenIDAndroidStatusView(hass))
     hass.http.register_view(openid_views.OpenIDSessionView(hass))
     hass.http.register_view(openid_views.OpenIDLogoutView(hass))
+    hass.http.register_view(openid_views.OpenIDBackchannelLogoutView(hass))
 
     domain_data[DATA_AUTH_PROVIDER] = await async_register_auth_provider(hass)
     domain_data[DATA_SHARED_INITIALIZED] = True

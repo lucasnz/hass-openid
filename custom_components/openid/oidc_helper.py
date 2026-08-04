@@ -169,3 +169,71 @@ async def async_validate_id_token(
             raise ValueError("ID token azp is invalid for a multi-audience token")
 
     return claims
+
+
+async def async_validate_logout_token(
+    hass: HomeAssistant,
+    *,
+    logout_token: str,
+    issuer: str,
+    jwks_url: str,
+    client_id: str,
+    algorithms: list[str],
+    validate_tls: bool = DEFAULT_VALIDATE_TLS,
+) -> dict[str, Any]:
+    """Validate an OIDC back-channel logout token."""
+    header = jwt.get_unverified_header(logout_token)
+    algorithm = header.get("alg")
+    key_id = header.get("kid")
+    allowed_algorithms = [
+        candidate
+        for candidate in algorithms
+        if candidate != "none" and not candidate.startswith("HS")
+    ]
+    if not isinstance(algorithm, str) or algorithm not in allowed_algorithms:
+        raise ValueError("Logout token uses an unsupported signing algorithm")
+
+    jwks_data = await _async_fetch_jwks(
+        hass,
+        issuer=issuer,
+        jwks_url=jwks_url,
+        validate_tls=validate_tls,
+    )
+    try:
+        signing_key = _select_signing_key(
+            jwks_data, key_id=key_id, algorithm=algorithm
+        )
+    except LookupError:
+        jwks_data = await _async_fetch_jwks(
+            hass,
+            issuer=issuer,
+            jwks_url=jwks_url,
+            validate_tls=validate_tls,
+            force_refresh=True,
+        )
+        signing_key = _select_signing_key(
+            jwks_data, key_id=key_id, algorithm=algorithm
+        )
+
+    decode = partial(
+        jwt.decode,
+        logout_token,
+        signing_key,
+        algorithms=[algorithm],
+        audience=client_id,
+        issuer=issuer,
+        leeway=_CLOCK_SKEW_SECONDS,
+        options={"require": ["iat", "iss", "aud", "jti", "events"]},
+    )
+    claims: dict[str, Any] = await hass.async_add_executor_job(decode)
+    if "nonce" in claims:
+        raise ValueError("Logout token must not contain a nonce")
+    events = claims.get("events")
+    event_name = "http://schemas.openid.net/event/backchannel-logout"
+    if not isinstance(events, dict) or event_name not in events:
+        raise ValueError("Logout token is missing the back-channel logout event")
+    if not isinstance(claims.get("sub"), str) and not isinstance(
+        claims.get("sid"), str
+    ):
+        raise ValueError("Logout token must contain sub or sid")
+    return claims

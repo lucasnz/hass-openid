@@ -55,18 +55,21 @@ from .const import (
     CRED_ID_TOKEN,
     CRED_ISSUER,
     CRED_LOGOUT_REDIRECT_URI,
+    CRED_SESSION_ID,
     CRED_SESSION_STATE,
     CRED_SUBJECT,
     DOMAIN,
 )
 from .oauth_helper import exchange_code_for_token, fetch_user_info
 from .http_security import html_response, json_response, redirect_response
-from .oidc_helper import async_validate_id_token
+from .oidc_helper import async_validate_id_token, async_validate_logout_token
 from .state_store import (
     ANDROID_STATE_STORE,
     ANDROID_STATE_TTL,
     LOGOUT_STATE_STORE,
     LOGOUT_STATE_TTL,
+    LOGOUT_TOKEN_JTI_STORE,
+    LOGOUT_TOKEN_JTI_TTL,
     AUTH_STATE_STORE,
     CONSENT_STATE_STORE,
     StateStoreFull,
@@ -616,6 +619,8 @@ class OpenIDCallbackView(HomeAssistantView):
         if id_token_claims is not None:
             new_credential_fields[CRED_ISSUER] = id_token_claims["iss"]
             new_credential_fields[CRED_SUBJECT] = id_token_claims["sub"]
+            if isinstance(id_token_claims.get("sid"), str):
+                new_credential_fields[CRED_SESSION_ID] = id_token_claims["sid"]
 
         if username_field == "email" and user_info.get("email_verified") is False:
             return _show_error(
@@ -1038,6 +1043,104 @@ class OpenIDLogoutView(HomeAssistantView):
                 status=HTTPStatus.BAD_REQUEST,
             )
         return redirect_response(target)
+
+
+class OpenIDBackchannelLogoutView(HomeAssistantView):
+    """Receive signed OIDC back-channel logout notifications."""
+
+    name = "api:openid:backchannel_logout"
+    url = "/auth/openid/backchannel_logout"
+    requires_auth = False
+
+    def __init__(self, hass: HomeAssistant) -> None:
+        """Initialize the back-channel logout view."""
+        self.hass = hass
+
+    async def post(self, request: Request) -> Response:
+        """Validate a logout token and revoke matching HA refresh tokens."""
+        if request.content_length is not None and request.content_length > 65536:
+            return Response(status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+        conf = get_active_config(self.hass)
+        if not conf or not all(
+            conf.get(key)
+            for key in (CONF_ISSUER, CONF_JWKS_URL, CONF_CLIENT_ID)
+        ):
+            return Response(status=HTTPStatus.NOT_FOUND)
+
+        form = await request.post()
+        logout_token = form.get("logout_token")
+        if not isinstance(logout_token, str) or not logout_token:
+            return Response(status=HTTPStatus.BAD_REQUEST)
+
+        algorithms = conf.get(CONF_ID_TOKEN_SIGNING_ALGORITHMS, ["RS256"])
+        if isinstance(algorithms, str):
+            algorithms = [algorithms]
+        try:
+            claims = await async_validate_logout_token(
+                self.hass,
+                logout_token=logout_token,
+                issuer=conf[CONF_ISSUER],
+                jwks_url=conf[CONF_JWKS_URL],
+                client_id=conf[CONF_CLIENT_ID],
+                algorithms=list(algorithms),
+                validate_tls=bool(conf.get(CONF_VALIDATE_TLS, True)),
+            )
+            jti = claims["jti"]
+            if get_pending(
+                self.hass,
+                LOGOUT_TOKEN_JTI_STORE,
+                jti,
+                ttl=LOGOUT_TOKEN_JTI_TTL,
+            ):
+                return Response(status=HTTPStatus.BAD_REQUEST)
+            store_pending(
+                self.hass,
+                LOGOUT_TOKEN_JTI_STORE,
+                jti,
+                {"used": True},
+                ttl=LOGOUT_TOKEN_JTI_TTL,
+            )
+        except (ValueError, LookupError, StateStoreFull):
+            _LOGGER.warning("Rejected invalid or replayed OIDC logout token")
+            return Response(status=HTTPStatus.BAD_REQUEST)
+        except Exception:
+            _LOGGER.exception("Failed to validate OIDC logout token")
+            return Response(status=HTTPStatus.SERVICE_UNAVAILABLE)
+
+        subject = claims.get("sub")
+        session_id = claims.get("sid")
+        issuer = claims.get("iss")
+        revoked = 0
+        for user in await self.hass.auth.async_get_users():
+            matching_credentials = [
+                credential
+                for credential in user.credentials
+                if credential.auth_provider_type == DOMAIN
+                and credential.data.get(CRED_ISSUER) == issuer
+                and (
+                    (subject is not None and credential.data.get(CRED_SUBJECT) == subject)
+                    or (
+                        session_id is not None
+                        and credential.data.get(CRED_SESSION_ID) == session_id
+                    )
+                )
+            ]
+            if not matching_credentials:
+                continue
+            refresh_tokens = getattr(user, "refresh_tokens", {})
+            tokens = (
+                list(refresh_tokens.values())
+                if isinstance(refresh_tokens, dict)
+                else list(refresh_tokens)
+            )
+            for refresh_token in tokens:
+                token_credential = getattr(refresh_token, "credential", None)
+                if any(token_credential is candidate for candidate in matching_credentials):
+                    self.hass.auth.async_remove_refresh_token(refresh_token)
+                    revoked += 1
+
+        _LOGGER.info("Processed OIDC back-channel logout; revoked %d session(s)", revoked)
+        return Response(status=HTTPStatus.NO_CONTENT)
 
 
 class OpenIDAndroidStatusView(HomeAssistantView):
